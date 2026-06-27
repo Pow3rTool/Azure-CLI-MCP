@@ -70,7 +70,10 @@ exchange + cert load happen per call, in an isolated `AZURE_CONFIG_DIR`.
    **Add a scope** `user_impersonation` (who can consent: Admins and users).
 3. **Certificates & secrets → Certificates → Upload** the public cert (step 2 below).
 4. **API permissions** → add the **delegated** downstream permissions you want reachable
-   (each is a *resource* the OBO can mint a token for), then **Grant admin consent**:
+   (each is a *resource* the OBO can mint a token for), then **Grant admin consent**.
+   **Grant the least set you need** — these are the *ceiling* of what any token can reach
+   (effective access is this ∩ the user's own RBAC); start read-only and add scopes
+   deliberately, don't grant the broad ones by reflex:
    - **Azure Service Management** → `user_impersonation` — the ARM management plane.
    - **Microsoft Graph** → `User.Read` (+ `Directory.Read.All` for read-only directory,
      or `Directory.ReadWrite.All` for directory admin).
@@ -151,6 +154,36 @@ MSAL account cache — three methods: `get_login_credentials` (ARM, honors
 `get_raw_token` (what `az ad` / `az rest` use). The result: the model writes ordinary
 `az` (and `az ad`) commands and they run as the user. See `azobo` and `server.py`.
 
+## Security & hardening
+
+This server runs the full Azure CLI as the signed-in user; treat it accordingly.
+
+- **Token validation is on by default** (`AZOBO_VALIDATE_TOKENS=true`): every request's
+  bearer is verified (signature via the tenant JWKS, audience, issuer, expiry) before any
+  claim is trusted. This is what makes `read_output`'s per-user isolation real — it never
+  does an OBO exchange, so it can't lean on Entra to reject a forged token.
+- **Run it unprivileged + sandboxed.** The provided `deploy/azobo-mcp.service` runs as a
+  dedicated `azobo` user with `ProtectSystem=strict`, dropped capabilities, a syscall
+  filter, `PrivateTmp`, and `UMask=0077`. Never run it as root.
+- **Command output is retained in memory only** (TTL'd, owner-scoped by immutable `oid`) —
+  no Key Vault secrets / Graph data are written to disk. Only the audit log (metadata) is
+  persisted, 0600.
+- **Least privilege:** grant the resource app only the downstream permissions you actually
+  need (§1.4), start read-only, and remember the consented permissions are just the
+  *ceiling* — effective access is that ceiling ∩ each user's own RBAC.
+- **Optional `AZOBO_READONLY`** forces Graph GET-only and refuses mutating `az` verbs as
+  defense-in-depth (RBAC is still the authoritative boundary).
+- The wrapped CLI runs with `AZURE_CORE_DISABLE_DYNAMIC_INSTALL=yes` so it can't
+  auto-install/run extension code.
+
 ## License
 
-The latest GPL i guess.
+**GNU Affero General Public License v3.0** (`AGPL-3.0-or-later`) — see [LICENSE](LICENSE).
+
+Why AGPL and not plain GPL: this is a *network service*. Plain GPLv3 lets anyone run a
+modified version as a hosted service without ever releasing their changes (the "SaaS
+loophole"). AGPLv3 closes it — §13 requires that anyone who interacts with a modified
+version **over a network** be offered the complete corresponding source. So a third party
+can use and build on this, but cannot take it private and offer it as a closed service.
+
+SPDX-License-Identifier: AGPL-3.0-or-later
