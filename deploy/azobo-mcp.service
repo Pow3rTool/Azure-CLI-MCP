@@ -1,13 +1,16 @@
 [Unit]
-Description=azobo MCP - per-user OBO Azure CLI + Microsoft Graph
-After=network-online.target
+Description=azobo MCP - per-user OBO Azure CLI
+After=network-online.target azobo-broker.service
 Wants=network-online.target
+# The broker holds the cert + mints tokens; the server cannot start usefully
+# without it (and must never read the cert itself).
+Requires=azobo-broker.service
 
 [Service]
-# Dedicated unprivileged user — NEVER run this as root. Create it once:
-#   useradd --system --no-create-home --shell /usr/sbin/nologin azobo
-# and make the OBO key readable only by it:
-#   chown azobo:azobo /etc/azobo/obo.key && chmod 600 /etc/azobo/obo.key
+# Dedicated unprivileged user — NEVER run this as root. This user does NOT own the
+# OBO key (the broker does); it only connects to the broker socket via the shared
+# `azobo` group. One-time setup (see azobo-broker.service for the broker user):
+#   useradd --system --no-create-home --shell /usr/sbin/nologin -g azobo azobo
 #   install -d -o azobo -g azobo -m 700 /var/lib/azobo   # audit log dir
 User=azobo
 Group=azobo

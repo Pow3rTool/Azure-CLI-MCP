@@ -5,13 +5,17 @@ signed-in user**, over an MCP endpoint, using OAuth 2.0 **On-Behalf-Of (OBO)**. 
 shared service-principal god-mode: every call carries the *user's own* identity and is
 bounded by *their own* Azure RBAC.
 
-Two generic passthrough tools (no curated/typed wrappers — the model uses its native
+Generic passthrough tools (no curated/typed wrappers — the model uses its native
 `az` fluency):
 
-- **`az_run(command)`** — raw Azure CLI (management plane **and** `az ad` directory).
-- **`graph_run(path, method, body)`** — raw Microsoft Graph REST.
+- **`az_run(command)`** — the full Azure CLI: management plane, the `az ad` directory,
+  **and** raw Microsoft Graph / any other endpoint via `rest --url …`.
+- **`read_output(output_id)`** — page a previous command's full output if it was truncated.
 
-## Why this is NOT a giant gaping security hole
+(There was a separate `graph_run` tool; it's gone — `az ad` + `az rest` cover raw Graph,
+so it was redundant surface.)
+
+## Why this is PROBABLY not a giant gaping security hole
 
 The question to answer before deploying, so let's be explicit:
 
@@ -23,9 +27,12 @@ The question to answer before deploying, so let's be explicit:
    RBAC + Entra role. A Contributor scoped to one resource group is blocked everywhere
    else (`AuthorizationFailed`/403) **by Azure**, not by trusting the agent. The tool
    cannot escalate anyone.
-3. **The certificate is a broker, not a key to the kingdom.** The confidential-client
-   cert can only *exchange a user's valid token* for a downstream token. With no user
-   assertion it mints nothing — it is not standing access to Azure.
+3. **The certificate is a broker, not a key to the kingdom — and it lives in its own
+   process.** The confidential-client cert can only *exchange a user's valid token* for a
+   downstream token (no assertion → it mints nothing). It is held by a **separate broker
+   process running as a different user**; the MCP server and the `az` subprocess reach it
+   only over a local socket, and **cannot read the key file** — so arbitrary `az` can't
+   exfiltrate it.
 4. **No shared standing credential.** The dangerous pattern — one over-privileged
    service principal everyone shares — is exactly what OBO avoids: no shared identity to
    over-permission, no lost attribution.
@@ -35,9 +42,11 @@ The question to answer before deploying, so let's be explicit:
 
 What you still must protect (honest threat model):
 
-- **The cert** (the OBO broker): if stolen, an attacker still needs a *valid user token*
-  to exchange — but protect it like any confidential-client key (file perms, ideally
-  HSM/Key Vault). On an Azure host, prefer a **federated Managed Identity** and no cert.
+- **The cert** (the OBO broker): held only by the broker process (own user, key `chmod
+  600` owned by it) — not readable by the server or the `az` subprocess. Stealing it still
+  needs a valid user assertion to be useful. On an Azure host you can drop it entirely for a
+  **federated Managed Identity**; on-prem, the broker-process split is the equivalent
+  isolation.
 - **In-flight user tokens**: TLS the endpoint; they're short-lived bearer creds.
 - **Writes are real.** `az group delete`, `az ad app create`, role assignments mutate
   the tenant as the user. Gate writes behind confirmation/step-up, not blanket auto-run.
@@ -45,14 +54,21 @@ What you still must protect (honest threat model):
 ## Architecture
 
 ```
-agent / MCP client ──(user OAuth bearer)──▶ azobo MCP server ──(OBO + cert)──▶ Entra ID
-     (token aud = resource app)                    │                              │
-                                                    ▼                              ▼
-                                       az / Microsoft Graph as the user ◀── downstream token
+                                          user=azobo                      user=azobo-broker
+agent / MCP client ─(user bearer)─▶ azobo MCP server ─register(assertion)─▶ OBO broker ─(cert+OBO)─▶ Entra ID
+   (aud = resource app)                  │  └─ validates token (JWKS)          │ (holds the cert)        │
+                                         ▼                                     ▼ mint(session,scopes)    ▼
+                                spawns `az` subprocess ───────────────────────┘ ◀──── downstream token ─┘
+                                (gets a SESSION id, not the assertion/cert)
 ```
 
-The server holds no per-user secret: the incoming bearer *is* the OBO assertion; the
-exchange + cert load happen per call, in an isolated `AZURE_CONFIG_DIR`.
+Two processes, two users. The **broker** is the only holder of the cert and the only thing
+that talks to Entra. The **server** validates the incoming bearer, registers a short-lived
+*session* with the broker, and hands the `az` subprocess only that opaque session id — never
+the cert, never the user assertion. The subprocess mints tokens for *its* session over the
+broker's local socket (group-restricted), so anything it could exfiltrate is bounded to the
+calling user's own short-lived tokens — not the shared cert, not other users. The broker's
+single long-lived MSAL client also gives a **shared token cache** (see below).
 
 ## Prerequisites
 
@@ -99,8 +115,8 @@ scope (admin-consented). Reuse an existing one if your platform already has it.
 ```bash
 openssl req -x509 -newkey rsa:2048 -days 730 -nodes \
   -keyout obo.key -out obo.crt -subj "/CN=azobo-obo"
-# Upload obo.crt to the resource app (1.3). Keep obo.key on the host, chmod 600,
-# readable by the service user. Thumbprint (no colons) for azobo.env:
+# Upload obo.crt to the resource app (1.3). The key is owned by the BROKER user only
+# (set in step 4); nothing on the `az` side can read it. Thumbprint (no colons):
 openssl x509 -in obo.crt -noout -fingerprint -sha1 | sed 's/.*=//; s/://g'
 ```
 
@@ -109,22 +125,37 @@ openssl x509 -in obo.crt -noout -fingerprint -sha1 | sed 's/.*=//; s/://g'
 ```bash
 python3 -m venv /opt/azobo/venv
 /opt/azobo/venv/bin/pip install -r requirements.txt
-install -m 755 server.py azobo /opt/azobo/
+install -m 755 server.py azobo obo_broker.py /opt/azobo/
 ```
 
-### 4. Configure
+### 4. Configure (two users, two env files)
+
+The broker holds the cert as its own user; the server connects over a group socket.
 
 ```bash
+sudo groupadd -f azobo
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin -g azobo azobo-broker
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin -g azobo azobo
 sudo install -d /etc/azobo
-sudo cp azobo.env.example /etc/azobo/azobo.env   # fill in the values
-sudo chmod 600 /etc/azobo/azobo.env
+sudo install -d -o azobo -g azobo -m 700 /var/lib/azobo            # audit log dir
+
+# Broker env + key — readable only by the broker user:
+sudo cp broker.env.example /etc/azobo/broker.env                   # fill in values
+sudo cp obo.key /etc/azobo/obo.key ; sudo cp obo.crt /etc/azobo/obo.crt
+sudo chown azobo-broker:azobo /etc/azobo/broker.env /etc/azobo/obo.key
+sudo chmod 640 /etc/azobo/broker.env ; sudo chmod 600 /etc/azobo/obo.key
+
+# Server env — no cert in it; readable by the server user:
+sudo cp azobo.env.example /etc/azobo/azobo.env                     # fill in values
+sudo chown azobo:azobo /etc/azobo/azobo.env ; sudo chmod 640 /etc/azobo/azobo.env
 ```
 
 ### 5. Run
 
 ```bash
-sudo cp deploy/azobo-mcp.service /etc/systemd/system/
-sudo systemctl enable --now azobo-mcp                 # listens on 127.0.0.1:8782
+sudo cp deploy/azobo-broker.service deploy/azobo-mcp.service /etc/systemd/system/
+sudo systemctl enable --now azobo-broker              # holds the cert; creates the socket
+sudo systemctl enable --now azobo-mcp                 # listens on 127.0.0.1:8782 (Requires broker)
 sudo cp deploy/nginx-azobo.conf /etc/nginx/sites-enabled/   # set your FQDN + TLS cert
 sudo nginx -t && sudo systemctl reload nginx
 ```
@@ -140,7 +171,8 @@ Point your MCP client at `https://<your-fqdn>/` with per-user OAuth: the **clien
   `--query` (JMESPath) and `-o json/table/tsv`; the agent parses JSON itself.
 - **Subscription context does not persist** between calls — pass `--subscription <id>`
   inline. `account list` shows accessible subscriptions.
-- **`az ad` works** (directory), as do `graph_run` and `az rest --resource <r> --url <u>`.
+- **`az ad` works** (directory); for raw Graph use `az rest --url https://graph.microsoft.com/v1.0/…`
+  (or `az rest --resource <r> --url <u>` for other audiences).
 - **Data plane** (blob contents, Key Vault secret values) needs BOTH the API permission
   (1.4) AND the *user's own* data-plane role (Storage Blob Data Reader, KV Secrets User)
   — management roles / Global Admin do **not** grant data access. Use `--auth-mode login`.
@@ -149,12 +181,18 @@ Point your MCP client at `https://<your-fqdn>/` with per-user OAuth: the **clien
 
 ## How it works (the trick)
 
-Azure CLI can't be handed a raw token via `az login`. `azobo` is a ~40-line wrapper that
+Azure CLI can't be handed a raw token via `az login`. `azobo` is a small wrapper that
 monkeypatches `azure-cli`'s `Profile` to inject an OBO token instead of using the local
 MSAL account cache — three methods: `get_login_credentials` (ARM, honors
 `--subscription`), `load_cached_subscriptions` (live subscription list), and
 `get_raw_token` (what `az ad` / `az rest` use). The result: the model writes ordinary
-`az` (and `az ad`) commands and they run as the user. See `azobo` and `server.py`.
+`az` (and `az ad`) commands and they run as the user.
+
+The wrapper itself holds **no** broker material — it's given an opaque, short-lived
+**session id** and mints each token by asking the **broker** over a local Unix socket
+(`obo_broker.py`). The broker is the only process that loads the cert and the only one that
+talks to Entra; it runs as a separate user. So the cert and the user assertion never enter
+the `az` subprocess. See `obo_broker.py`, `azobo`, and `server.py`.
 
 ## Security & hardening
 
@@ -164,9 +202,11 @@ This server runs the full Azure CLI as the signed-in user; treat it accordingly.
   bearer is verified (signature via the tenant JWKS, audience, issuer, expiry) before any
   claim is trusted. This is what makes `read_output`'s per-user isolation real — it never
   does an OBO exchange, so it can't lean on Entra to reject a forged token.
-- **Run it unprivileged + sandboxed.** The provided `deploy/azobo-mcp.service` runs as a
-  dedicated `azobo` user with `ProtectSystem=strict`, dropped capabilities, a syscall
-  filter, `PrivateTmp`, and `UMask=0077`. Never run it as root.
+- **Two processes, two users, sandboxed.** The cert lives only in `azobo-broker.service`
+  (user `azobo-broker`); the MCP server (`azobo-mcp.service`, user `azobo`) reaches it over
+  a group-restricted local socket and can't read the key. Both units run with
+  `ProtectSystem=strict`, dropped capabilities, a syscall filter, `PrivateTmp`, and
+  `UMask=0077`. Never run either as root.
 - **Command output is retained in memory only** (TTL'd, owner-scoped by immutable `oid`) —
   no Key Vault secrets / Graph data are written to disk. Only the audit log (metadata) is
   persisted, 0600.
@@ -178,10 +218,6 @@ This server runs the full Azure CLI as the signed-in user; treat it accordingly.
   `TasksMax`; the server caps **captured** bytes per command (`AZOBO_MAX_CAPTURE_BYTES`,
   killing the child if exceeded) and the total bytes retained in memory. A runaway can kill
   the *service*, not the host.
-- **Egress is fenced off from the host metadata endpoint.** The unit's
-  `IPAddressDeny=169.254.0.0/16 fe80::/10` stops `az rest`/SSRF from reaching IMDS to lift
-  the *host's* managed-identity token. Public Azure endpoints are unaffected; uncomment the
-  RFC1918 ranges to also fence internal networks.
 - **Caller authorization.** Validate more than aud/iss/exp in a multi-client tenant:
   `AZOBO_REQUIRED_SCOPE` (the token's `scp` must contain it, e.g. `user_impersonation`) and
   `AZOBO_ALLOWED_CLIENTS` (allow-list of calling app IDs via `azp`/`appid`). Prefer
@@ -203,26 +239,42 @@ This server runs the full Azure CLI as the signed-in user; treat it accordingly.
   no-ops; verify with `systemctl show azobo-mcp -p IPAddressDeny`.
 - The wrapped CLI runs with `AZURE_CORE_DISABLE_DYNAMIC_INSTALL=yes` (no extension code
   auto-runs) and a **minimal environment** (only the vars the wrapper needs).
+- **Token caching (no Entra hammering).** The broker's single long-lived MSAL client caches
+  OBO tokens in memory keyed by (user, scopes), serving repeats and refreshing ~5 min before
+  expiry — so back-to-back commands by the same user don't re-hit Entra. (In-memory only;
+  OBO tokens are never written to disk, and a broker restart just re-warms.)
 - **Disk:** `LimitFSIZE` caps a *single* file; a batch of many sub-limit files can still fill
   the writable paths. For untrusted use, mount `/var/lib/azobo` (and `/tmp`) as size-limited
   tmpfs / with a disk quota, or don't expose persistent writable paths to the child at all.
 
-### Threat model & the one residual you must accept (or design out)
+### Threat model
 
 The boundary this tool relies on is **per-user Azure RBAC**: every call is the signed-in
 user, so it can do only what that user could already do from their own machine. A 403 is
 the boundary working. It is built for **trusted operators**, not anonymous internet users.
 
-The genuine residual: the OBO broker certificate sits on disk readable by the same `azobo`
-user that runs arbitrary `az`, so a malicious caller could `az rest --body @/etc/azobo/obo.key`
-and exfiltrate it (and the user assertion is likewise handed to the CLI subprocess via env).
-The sandbox stops host takeover but **cannot** hide the key from `az`, because the OBO
-exchange happens *inside* the `az` subprocess (the wrapper reads the key).
+**The crown-jewel residual — the shared cert — is closed by the broker split.** Earlier
+versions read the OBO key inside the `az` subprocess, so `az rest --body @/etc/azobo/obo.key`
+could exfiltrate the cert that's *shared across all users* (offline OBO for anyone, forever
+— far worse than one session). Now the cert lives only in the broker process (separate user,
+key `chmod 600`), the server validates tokens but never reads the cert, and the subprocess
+gets only a short-lived session id. The cert and the user assertion **never enter the `az`
+subprocess**, so there's nothing of that value for `az rest` to read.
 
-**Why the cert matters more than "the user can already act as themselves":** the cert is
-**shared across all users**. Stealing it lets an attacker run the OBO exchange offline —
-outside your sandbox, audit log, and IMDS fence — for *any* user whose assertion they can
-obtain. That is a broader and more durable capability than a single authenticated session.
+What remains (inherent to OBO, and much smaller): a malicious `az` command in a session can
+still mint *that one user's* tokens via the broker socket and exfiltrate them to a public
+endpoint. But that's the user's own authority — short-lived, online, auditable, revocable by
+ending the session — not the shared, offline, durable cert. Bound it further for
+less-trusted callers with `AZOBO_DENY_COMMANDS=rest,account get-access-token` and/or an
+egress allow-list (see above).
+
+**Deployment posture (pick one, write it down):**
+- *Broker split on trusted-operator on-prem (this design):* the shared-cert exfil path is
+  closed; acceptable for operators, with `AZOBO_READONLY=true` unless you need writes.
+- *Federated Managed Identity (Azure):* no key file at all — strongest; the broker split is
+  the on-prem equivalent.
+- *Anything less than trusted callers:* add `AZOBO_DENY_COMMANDS` + egress allow-list, or
+  don't expose it.
 
 The real fix is to **not keep a cert on disk at all**. On Azure, deploy with a **federated
 Managed Identity** (the recommended default): the OBO confidential client authenticates via

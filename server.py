@@ -1,5 +1,4 @@
-import os, re, shlex, shutil, signal, subprocess, tempfile, json, time, uuid, base64, threading
-import urllib.request, urllib.error, msal
+import os, re, shlex, shutil, signal, socket, subprocess, tempfile, json, time, uuid, base64, threading
 from collections import OrderedDict
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -9,19 +8,20 @@ os.umask(0o077)
 
 PUBLIC_HOST = os.environ.get("AZOBO_PUBLIC_HOST", "localhost")
 TENANT = os.environ["AZOBO_TENANT_ID"]; CLIENT = os.environ["AZOBO_CLIENT_ID"]
-THUMB = os.environ["AZOBO_CERT_THUMBPRINT"]
-KEY = os.environ["AZOBO_CERT_KEY"]; CERT = os.environ["AZOBO_CERT_PUB"]
 DEFAULT_SUB = os.environ.get("AZOBO_DEFAULT_SUBSCRIPTION", "")
 VENV_PY = os.environ.get("AZOBO_PYTHON", "/opt/azobo/venv/bin/python")
 AZOBO = os.environ.get("AZOBO_WRAPPER", "/opt/azobo/azobo")
+# The OBO cert lives ONLY in the broker process (separate user); the server and the
+# `az` subprocess mint tokens over this local socket and never read the key.
+BROKER_SOCKET = os.environ.get("AZOBO_BROKER_SOCKET", "/run/azobo/broker.sock")
 TIMEOUT = int(os.environ.get("AZOBO_TIMEOUT", "150"))
 MAX_OUT = int(os.environ.get("AZOBO_MAX_OUTPUT_CHARS", "100000"))  # ~25k tokens; full output kept in memory
 AUDIT = os.environ.get("AZOBO_AUDIT_LOG", "/var/lib/azobo/audit.log")
 
-# Hard ceiling on how many bytes we CAPTURE from a single command (stdout+stderr).
-# Enforced WHILE reading — the child is killed once it exceeds this, so a runaway
-# `az ... download` / huge `az rest` response can't buffer gigabytes into RAM before
-# MAX_OUT (which only trims what we RETURN) ever applies.
+# Hard ceiling on bytes CAPTURED from a single command (stdout+stderr). Enforced
+# WHILE reading — the child is killed once it exceeds this, so a runaway
+# `az ... download` can't buffer gigabytes into RAM before MAX_OUT (which only
+# trims what we RETURN) ever applies.
 MAX_CAPTURE = int(os.environ.get("AZOBO_MAX_CAPTURE_BYTES", str(20 * 1024 * 1024)))  # 20 MB
 
 # Full captured output is retained IN MEMORY only (never written to disk) so a
@@ -32,8 +32,8 @@ OUT_MAX_BYTES = int(os.environ.get("AZOBO_OUTPUT_MAX_BYTES", str(100 * 1024 * 10
 OUT_TTL = int(os.environ.get("AZOBO_OUTPUT_TTL_SECONDS", "1800"))
 
 # Server-enforced read-only mode (defense-in-depth ON TOP OF per-user RBAC, which
-# is the real boundary). When on: Graph is GET-only and mutating `az` verbs are
-# refused. Default off — the deployment opts in.
+# is the real boundary). When on: mutating `az` verbs (incl. rest/invoke non-GET)
+# are refused. Default off — the deployment opts in (example env ships it ON).
 READONLY = os.environ.get("AZOBO_READONLY", "").lower() in ("1", "true", "yes")
 
 # Verify the incoming bearer is a real Entra token for THIS tenant+app before
@@ -44,14 +44,11 @@ AUDIENCE = [x for x in (CLIENT, f"api://{CLIENT}", os.environ.get("AZOBO_AUDIENC
 
 # Caller authorization (beyond aud/iss/exp). Multi-client tenants: a token another
 # client obtains for THIS resource app would otherwise pass. Set these in prod.
-#   AZOBO_REQUIRED_SCOPE   — the token's `scp` must contain it (e.g. user_impersonation)
-#   AZOBO_ALLOWED_CLIENTS  — comma list; the token's azp/appid must be one of these
 REQUIRED_SCOPE = os.environ.get("AZOBO_REQUIRED_SCOPE", "").strip()
 ALLOWED_CLIENTS = [x.strip() for x in os.environ.get("AZOBO_ALLOWED_CLIENTS", "").split(",") if x.strip()]
 
 # Command denylist (egress/exfil control). e.g. "rest,account get-access-token" to
-# remove the rawest token/SSRF primitives for less-trusted deployments. Matched as a
-# prefix of the `az` command (sans leading `az`). Empty = allow all.
+# remove the rawest token/SSRF primitives for less-trusted deployments.
 DENY_CMDS = [x.strip() for x in os.environ.get("AZOBO_DENY_COMMANDS", "").split(",") if x.strip()]
 
 # Optional concurrency cap (backstop alongside MemoryMax). 0 = unlimited.
@@ -84,10 +81,12 @@ _outputs = OrderedDict()  # output_id -> (owner_oid, text, ts)
 
 mcp = FastMCP("azure-obo",
     instructions=("Operate Azure and Entra AS THE SIGNED-IN USER (per-user on-behalf-of). "
-        "az_run = full Azure CLI (management plane AND `az ad` directory); graph_run = raw "
-        "Microsoft Graph REST; read_output = page a previous command's full output if it was "
-        "truncated. Everything is bounded by the user's own Azure RBAC + Entra role — a 403 / "
-        "AuthorizationFailed is their permission boundary, not a bug."),
+        "az_run = the full Azure CLI: management plane, the `az ad` directory (Entra apps, "
+        "service principals, users, groups), AND any other endpoint via "
+        "`rest --method GET --url <url>` (e.g. raw Microsoft Graph). read_output pages a "
+        "previous command's full output if it was truncated. Everything is bounded by the "
+        "user's own Azure RBAC + Entra role — a 403 / AuthorizationFailed is their permission "
+        "boundary, not a bug."),
     host="127.0.0.1", port=8782, stateless_http=False, json_response=False, streamable_http_path="/",
     transport_security=TransportSecuritySettings(
         allowed_hosts=[PUBLIC_HOST, f"{PUBLIC_HOST}:443", "127.0.0.1:8782", "localhost:8782"],
@@ -100,17 +99,22 @@ def _bearer(ctx):
     except Exception:
         return ""
 
-_graph = None
-def _graph_app():
-    """Confidential client for the Graph OBO exchange — built once (cert/key read
-    a single time at first use, not per request)."""
-    global _graph
-    if _graph is None:
-        _graph = msal.ConfidentialClientApplication(
-            CLIENT, authority=f"https://login.microsoftonline.com/{TENANT}",
-            client_credential={"private_key": open(KEY).read(), "thumbprint": THUMB,
-                               "public_certificate": open(CERT).read()})
-    return _graph
+def _broker(req):
+    """One request → one response against the OBO credential broker (the only holder
+    of the cert). Newline-delimited JSON over the local Unix socket."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(TIMEOUT)
+    try:
+        s.connect(BROKER_SOCKET)
+        s.sendall((json.dumps(req) + "\n").encode())
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        return json.loads(buf.split(b"\n", 1)[0] or b"{}")
+    finally:
+        s.close()
 
 _jwks = None
 def _jwks_client():
@@ -131,9 +135,8 @@ def _identity(bearer):
     """Return (owner_oid, display) ONLY after the token is cryptographically verified
     for this tenant+app (signature via JWKS, audience, issuer, expiry). Returns None
     when the token fails validation — callers MUST reject. This is the access control
-    for read_output (which never does an OBO exchange, so it can't lean on Entra to
-    reject a forged token like az_run/graph_run implicitly do). When
-    AZOBO_VALIDATE_TOKENS is off, falls back to the unverified payload (lab/trusted only)."""
+    for read_output (which never does an OBO exchange). When AZOBO_VALIDATE_TOKENS is
+    off, falls back to the unverified payload (lab/trusted only)."""
     if not bearer:
         return None
     if not VALIDATE:
@@ -150,9 +153,6 @@ def _identity(bearer):
         if claims.get("iss", "") not in (f"https://login.microsoftonline.com/{TENANT}/v2.0",
                                           f"https://sts.windows.net/{TENANT}/"):
             return None
-        # Caller authorization: required delegated scope, and an allow-list of
-        # client apps (azp/appid) — so a token another client minted for this
-        # resource app can't drive it. Both opt-in (empty = no extra constraint).
         if REQUIRED_SCOPE and REQUIRED_SCOPE not in str(claims.get("scp", "")).split():
             return None
         if ALLOWED_CLIENTS and (claims.get("azp") or claims.get("appid")) not in ALLOWED_CLIENTS:
@@ -219,7 +219,7 @@ def _run_capped(argv, env, timeout, cap):
     stderr even on success, and the agent json.loads our stdout). Binary-safe (raw
     bytes, decoded at the end). Total captured is capped at `cap` BYTES across both
     streams; the child's whole process group is SIGKILLed the instant it exceeds the
-    cap, so a runaway download/response can't buffer gigabytes into RAM. Returns
+    cap, so a runaway download can't buffer gigabytes into RAM. Returns
     (stdout, stderr, rc, capped, timed_out)."""
     p = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          start_new_session=True)  # binary pipes
@@ -261,8 +261,8 @@ def az_run(command: str, ctx: Context) -> str:
     """Run a raw Azure CLI command AS YOU (the signed-in user, via on-behalf-of) and return its output.
     Write it as in a terminal but WITHOUT the leading `az` (e.g. `network vnet show -g RG -n NAME -o json`,
     `vm list -o table`, `group list --query "[].name"`, `ad app list`). Full az surface, under YOUR Azure
-    RBAC. Directory works too: `ad app/sp/user/group ...`. For any other endpoint/audience use
-    `rest --method GET --url <url> --resource <resource>`.
+    RBAC. Directory works too: `ad app/sp/user/group ...`. For raw Microsoft Graph or any other
+    endpoint/audience use `rest --method GET --url <url>` (e.g. `rest --url https://graph.microsoft.com/v1.0/me`).
     Rules: ONE command per call (no `&&`/pipes/`--follow`/`--watch`); filter with `--query` (JMESPath) and
     `-o json/table/tsv`. Large output is truncated in the reply but FULLY retained — page it with
     read_output(output_id). A 403/AuthorizationFailed/empty result outside your scope is your permission
@@ -291,81 +291,46 @@ def az_run(command: str, ctx: Context) -> str:
     joined = " ".join(argv)
     if any(joined == d or joined.startswith(d + " ") for d in DENY_CMDS):
         return json.dumps({"error": "that command is disabled on this server (AZOBO_DENY_COMMANDS)."})
+
+    # Register a short-lived broker session for this user, and hand the subprocess
+    # only the opaque session id — NOT the assertion and NOT the cert. The wrapper
+    # mints tokens by presenting the session over the broker socket.
+    try:
+        reg = _broker({"op": "register", "assertion": a})
+    except Exception as e:
+        return json.dumps({"error": f"credential broker unreachable: {type(e).__name__}: {str(e)[:120]}"})
+    sid = reg.get("session")
+    if not sid:
+        return json.dumps({"error": f"broker register failed: {reg.get('error', 'no session')}"})
+
     cfg = tempfile.mkdtemp(prefix="azcfg-"); t0 = time.time()
-    # Minimal env — only what the wrapper + Azure CLI need. Avoid leaking the
-    # broader process environment (and reduce blast radius) into the subprocess.
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
            "HOME": cfg, "LANG": os.environ.get("LANG", "C.UTF-8"),
-           "AZOBO_ASSERTION": a, "AZOBO_CLIENT_ID": CLIENT, "AZOBO_KEY": KEY, "AZOBO_CERT": CERT,
-           "AZOBO_THUMB": THUMB, "AZURE_TENANT_ID": TENANT, "AZURE_SUBSCRIPTION_ID": DEFAULT_SUB,
+           "AZURE_TENANT_ID": TENANT, "AZURE_SUBSCRIPTION_ID": DEFAULT_SUB,
            "AZURE_CONFIG_DIR": cfg, "AZURE_EXTENSION_DIR": os.path.join(cfg, "ext"),
-           "AZURE_CORE_DISABLE_DYNAMIC_INSTALL": "yes", "AZURE_CORE_COLLECT_TELEMETRY": "no"}
+           "AZURE_CORE_DISABLE_DYNAMIC_INSTALL": "yes", "AZURE_CORE_COLLECT_TELEMETRY": "no",
+           "AZOBO_BROKER_SOCKET": BROKER_SOCKET, "AZOBO_SESSION": sid}
     try:
         with (_sem or _nullctx()):
             so, se, rc, capped, timed_out = _run_capped([VENV_PY, AZOBO] + argv, env, TIMEOUT, MAX_CAPTURE)
         if timed_out:
             out = json.dumps({"error": f"timed out after {TIMEOUT}s — for long ops use --no-wait + poll status"})
         else:
-            # Keep the clean contract: on success return stdout only (az writes
-            # warnings to stderr even on rc==0); only fold stderr in on failure.
+            # Clean contract: on success return stdout only (az writes warnings to
+            # stderr even on rc==0); only fold stderr in on failure.
             out = (so if rc == 0 else (so + se)).strip() or "(no output)"
             if capped:
                 out += (f"\n\n[…CAPPED: output exceeded {MAX_CAPTURE} bytes and the command was terminated. "
                         "Narrow it with --query / -o tsv / --top, or download to Azure-side storage instead.]")
     finally:
         shutil.rmtree(cfg, ignore_errors=True)
+        try: _broker({"op": "end", "session": sid})  # best-effort; broker also TTLs
+        except Exception: pass
     return _finalize(owner, who, "az_run", command, out, rc, time.time() - t0)
 
 @mcp.tool()
-def graph_run(path: str, ctx: Context, method: str = "GET", body: str = "", allow_write: bool = False) -> str:
-    """Call Microsoft Graph AS YOU (per-user OBO) — the directory tool (Entra/AAD apps, service
-    principals, users, groups). path e.g. `applications`, `servicePrincipals?$top=10`, `me` (v1.0 assumed).
-    method GET (default)/POST/PATCH/DELETE; mutations require allow_write=true; body = JSON string.
-    Note: `az ad ...` and `az rest` (via az_run) also reach Graph. Large output is truncated + retained
-    (page with read_output)."""
-    a = _bearer(ctx)
-    if not a:
-        return json.dumps({"error": "no bearer token on request"})
-    ident = _identity(a)
-    if ident is None:
-        return json.dumps({"error": "unauthenticated: bearer failed validation (signature/audience/issuer/expiry)"})
-    owner, who = ident
-    if method.upper() != "GET" and (READONLY or not allow_write):
-        msg = "server is in read-only mode (AZOBO_READONLY)" if READONLY else f"{method} is a write — pass allow_write=true to permit"
-        return json.dumps({"error": msg})
-    t0 = time.time()
-    try:
-        r = _graph_app().acquire_token_on_behalf_of(
-            user_assertion=a, scopes=["https://graph.microsoft.com/.default"])
-    except Exception as e:
-        return json.dumps({"error": f"graph OBO error: {type(e).__name__}: {str(e)[:160]}"})
-    if "access_token" not in r:
-        return json.dumps({"error": f"graph OBO failed: {r.get('error')}: {str(r.get('error_description'))[:160]}"})
-    p = path.lstrip("/"); p = p if p.startswith(("v1.0/", "beta/")) else "v1.0/" + p
-    req = urllib.request.Request("https://graph.microsoft.com/" + p, data=(body.encode() if body else None),
-        method=method.upper(), headers={"Authorization": "Bearer " + r["access_token"],
-                                        "Content-Type": "application/json"})
-    try:
-        with (_sem or _nullctx()):
-            resp = urllib.request.urlopen(req, timeout=TIMEOUT)
-            raw = resp.read(MAX_CAPTURE + 1)  # bounded read — don't buffer an unbounded response
-        out = raw[:MAX_CAPTURE].decode(errors="replace") or json.dumps({"status": resp.status}); rc = 0
-        if len(raw) > MAX_CAPTURE:
-            out += f"\n\n[…CAPPED at {MAX_CAPTURE} bytes — narrow with $select/$top/$filter.]"
-    except urllib.error.HTTPError as e:
-        body = e.read(MAX_CAPTURE) or b"{}"
-        try:
-            err = json.loads(body)
-        except Exception:
-            err = {"raw": body.decode(errors="replace")[:1000]}  # non-JSON (e.g. a proxy's HTML 502)
-        out = json.dumps({"status": e.code, "error": err}); rc = e.code
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
-        out = json.dumps({"error": f"graph request failed: {type(e).__name__}: {str(e)[:160]}"}); rc = -1
-    return _finalize(owner, who, "graph_run", f"{method} {path}", out, rc, time.time() - t0)
-
-@mcp.tool()
 def read_output(output_id: str, ctx: Context, offset: int = 0, max_chars: int = 0) -> str:
-    """Read (more of) a previous command's FULL retained output when az_run/graph_run truncated it.
+    """Read (more of) a previous command's FULL retained output when az_run truncated it.
     Pass the output_id from the truncation note. offset = start char; max_chars = how many (default = cap).
     Only the user who produced the output can read it; output is held in memory and expires."""
     a = _bearer(ctx)

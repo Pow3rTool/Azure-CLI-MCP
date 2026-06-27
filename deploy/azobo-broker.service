@@ -1,0 +1,59 @@
+[Unit]
+Description=azobo OBO credential broker (sole holder of the OBO cert)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Runs as its OWN user, distinct from the `azobo` user that runs the MCP server +
+# the arbitrary `az` subprocess. The OBO key is chmod 600 owned by azobo-broker, so
+# nothing on the `az` side can read it. The shared `azobo` group lets the server
+# connect to the socket (but not read the key). One-time setup:
+#   groupadd azobo
+#   useradd --system --no-create-home --shell /usr/sbin/nologin -g azobo azobo-broker
+#   useradd --system --no-create-home --shell /usr/sbin/nologin -g azobo azobo
+#   chown azobo-broker:azobo /etc/azobo/obo.key && chmod 600 /etc/azobo/obo.key
+User=azobo-broker
+Group=azobo
+EnvironmentFile=/etc/azobo/broker.env
+ExecStart=/opt/azobo/venv/bin/python /opt/azobo/obo_broker.py
+Restart=always
+RestartSec=3
+
+# Socket lives in /run/azobo (created group-readable so the `azobo` server can
+# connect); the broker chmods the socket 0660.
+RuntimeDirectory=azobo
+RuntimeDirectoryMode=0750
+
+# --- sandbox: this process holds the crown jewel, lock it down hard ----------
+NoNewPrivileges=yes
+UMask=0077
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+MemoryMax=512M
+TasksMax=32
+# Block IMDS/link-local (broker only needs public Entra). Verify it's enforced:
+#   systemctl show azobo-broker -p IPAddressDeny
+IPAddressDeny=169.254.0.0/16 fe80::/10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,19 +1,35 @@
-import os, sys, time, json, base64, datetime, urllib.request, msal
+import os, sys, time, json, base64, datetime, socket
 from azure.cli.core import _profile
 from azure.core.credentials import AccessToken
 
-TENANT=os.environ["AZURE_TENANT_ID"]; CLIENT=os.environ["AZOBO_CLIENT_ID"]
-_app = msal.ConfidentialClientApplication(CLIENT, authority=f"https://login.microsoftonline.com/{TENANT}",
-    client_credential={"private_key": open(os.environ["AZOBO_KEY"]).read(),
-                       "thumbprint": os.environ["AZOBO_THUMB"],
-                       "public_certificate": open(os.environ["AZOBO_CERT"]).read()})
-_assertion = os.environ["AZOBO_ASSERTION"]
+# This wrapper holds NO broker material: no cert, no client secret, not even the
+# user assertion. It is handed an opaque, short-lived broker SESSION id and mints
+# OBO tokens by asking the broker over its local socket. So arbitrary `az` running
+# in this process (e.g. `az rest --body @…`) has nothing of value to exfiltrate.
+TENANT = os.environ["AZURE_TENANT_ID"]
+SOCK = os.environ["AZOBO_BROKER_SOCKET"]
+SESSION = os.environ["AZOBO_SESSION"]
+
+def _broker(req):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(60)
+    try:
+        s.connect(SOCK)
+        s.sendall((json.dumps(req) + "\n").encode())
+        buf = b""
+        while b"\n" not in buf:
+            c = s.recv(65536)
+            if not c:
+                break
+            buf += c
+        return json.loads(buf.split(b"\n", 1)[0] or b"{}")
+    finally:
+        s.close()
 
 def _obo(scopes):
-    r = _app.acquire_token_on_behalf_of(user_assertion=_assertion, scopes=list(scopes))
-    if "access_token" not in r:
-        raise Exception(f"OBO failed for {list(scopes)}: {r.get('error')}: {str(r.get('error_description'))[:120]}")
-    return r["access_token"]
+    r = _broker({"op": "mint", "session": SESSION, "scopes": list(scopes)})
+    if "token" not in r:
+        raise Exception(f"broker mint failed for {list(scopes)}: {r.get('error')}")
+    return r["token"]
 
 def _exp(t):
     try:
@@ -51,7 +67,8 @@ def _raw(self, resource=None, scopes=None, subscription=None, tenant=None, crede
     te={"accessToken":tok,"expires_on":exp,"expiresOn":datetime.datetime.fromtimestamp(exp).strftime("%Y-%m-%d %H:%M:%S.%f")}
     return (("Bearer", tok, te), subscription or os.environ.get("AZURE_SUBSCRIPTION_ID"), tenant or TENANT)
 
-if os.environ.get("AZOBO_ASSERTION"):
+import urllib.request
+if os.environ.get("AZOBO_SESSION"):
     _profile.Profile.get_login_credentials = (lambda self, resource=None, subscription_id=None, *a, **k: (OboCred(), subscription_id or os.environ.get("AZURE_SUBSCRIPTION_ID"), TENANT))
     _profile.Profile.load_cached_subscriptions = _load_subs
     _profile.Profile.get_raw_token = _raw
