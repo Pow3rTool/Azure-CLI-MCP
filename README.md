@@ -275,33 +275,23 @@ gets only a short-lived session id. The cert and the user assertion **never ente
 subprocess**, so there's nothing of that value for `az rest` to read.
 
 What remains (inherent to OBO, and much smaller): a malicious `az` command in a session can
-still mint *that one user's* tokens via the broker socket and exfiltrate them to a public
-endpoint. But that's the user's own authority — short-lived, online, auditable, revocable by
-ending the session — not the shared, offline, durable cert. Bound it further for
-less-trusted callers with `AZOBO_DENY_COMMANDS=rest,account get-access-token` and/or an
-egress allow-list (see above).
+still mint *that one user's* tokens. `az rest` is domain-locked to Microsoft endpoints, so it
+can't POST them to an arbitrary attacker URL — but an attacker controlling their own Azure
+resource (e.g. a storage account they own) could still receive them. That's the user's own
+authority: short-lived, online, auditable, revocable by ending the session — nothing like the
+shared, offline, durable cert. An egress proxy allow-listing only the Azure endpoints you use
+closes even that.
 
 **Deployment posture (pick one, write it down):**
-- *Broker split on trusted-operator on-prem (this design):* the shared-cert exfil path is
-  closed; acceptable for operators, with `AZOBO_READONLY=true` unless you need writes.
-- *Federated Managed Identity (Azure):* no key file at all — strongest; the broker split is
-  the on-prem equivalent.
-- *Anything less than trusted callers:* add `AZOBO_DENY_COMMANDS` + egress allow-list, or
-  don't expose it.
-
-The real fix is to **not keep a cert on disk at all**. On Azure, deploy with a **federated
-Managed Identity** (the recommended default): the OBO confidential client authenticates via
-the platform, no key file exists, and there is nothing for `az rest` to read. The next step
-beyond that is a **separate credential-broker process** that mints OBO tokens over a local
-socket so the CLI subprocess never holds broker material *or the user assertion* — planned,
-not yet built.
-
-**Pick your deployment posture explicitly:**
-- *Federated Managed Identity (no key file):* residual essentially gone — ready.
-- *Cert on disk + fully trusted operators only:* acceptable with eyes open — ready, with that
-  constraint written down and `AZOBO_READONLY=true` unless you deliberately need writes.
-- *Cert on disk + anything less than fully trusted callers:* **not ready** — close `az rest`
-  (`AZOBO_DENY_COMMANDS`) + egress-allow-list first, or move to Managed Identity.
+- *Broker split, trusted operators on-prem (this design, as deployed):* the shared-cert exfil
+  path is closed — the cert lives in a separate-user broker, unreadable from the `az` side, and
+  the user assertion never enters the subprocess. Acceptable for operators; keep
+  `AZOBO_READONLY=true` unless they need writes.
+- *Federated Managed Identity (Azure):* no key file at all — strongest. The broker split is the
+  on-prem equivalent of this.
+- *Less than fully trusted callers:* apply the lock-it-down recipe above (read-only,
+  scope/client allow-lists, the `rest` domain-lock, deny `account get-access-token`) **and** an
+  egress proxy allow-list — or don't expose it.
 
 ## License
 

