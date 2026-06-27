@@ -42,6 +42,32 @@ READONLY = os.environ.get("AZOBO_READONLY", "").lower() in ("1", "true", "yes")
 VALIDATE = os.environ.get("AZOBO_VALIDATE_TOKENS", "true").lower() in ("1", "true", "yes")
 AUDIENCE = [x for x in (CLIENT, f"api://{CLIENT}", os.environ.get("AZOBO_AUDIENCE", "")) if x]
 
+# Caller authorization (beyond aud/iss/exp). Multi-client tenants: a token another
+# client obtains for THIS resource app would otherwise pass. Set these in prod.
+#   AZOBO_REQUIRED_SCOPE   — the token's `scp` must contain it (e.g. user_impersonation)
+#   AZOBO_ALLOWED_CLIENTS  — comma list; the token's azp/appid must be one of these
+REQUIRED_SCOPE = os.environ.get("AZOBO_REQUIRED_SCOPE", "").strip()
+ALLOWED_CLIENTS = [x.strip() for x in os.environ.get("AZOBO_ALLOWED_CLIENTS", "").split(",") if x.strip()]
+
+# Command denylist (egress/exfil control). e.g. "rest,account get-access-token" to
+# remove the rawest token/SSRF primitives for less-trusted deployments. Matched as a
+# prefix of the `az` command (sans leading `az`). Empty = allow all.
+DENY_CMDS = [x.strip() for x in os.environ.get("AZOBO_DENY_COMMANDS", "").split(",") if x.strip()]
+
+# Optional concurrency cap (backstop alongside MemoryMax). 0 = unlimited.
+MAX_CONC = int(os.environ.get("AZOBO_MAX_CONCURRENCY", "0"))
+import contextlib
+_sem = threading.Semaphore(MAX_CONC) if MAX_CONC > 0 else None
+def _nullctx():
+    return contextlib.nullcontext()
+
+# Audit: redact secret-bearing flag VALUES from the logged command.
+_SECRET_FLAG = re.compile(
+    r'(--(?:password|secret|value|client-secret|certificate-password|body|headers?|'
+    r'token|sas[-_]?token|account-key|connection-string|admin-password)[ =])(\S+)', re.I)
+def _scrub(cmd):
+    return _SECRET_FLAG.sub(lambda m: m.group(1) + "***", cmd or "")[:500]
+
 # Azure CLI verbs that mutate — refused in read-only mode. Best-effort (the CLI
 # has no clean read/write taxonomy); RBAC remains the authoritative boundary.
 _MUTATING = {"create", "delete", "update", "set", "add", "remove", "purge", "regenerate",
@@ -124,13 +150,20 @@ def _identity(bearer):
         if claims.get("iss", "") not in (f"https://login.microsoftonline.com/{TENANT}/v2.0",
                                           f"https://sts.windows.net/{TENANT}/"):
             return None
+        # Caller authorization: required delegated scope, and an allow-list of
+        # client apps (azp/appid) — so a token another client minted for this
+        # resource app can't drive it. Both opt-in (empty = no extra constraint).
+        if REQUIRED_SCOPE and REQUIRED_SCOPE not in str(claims.get("scp", "")).split():
+            return None
+        if ALLOWED_CLIENTS and (claims.get("azp") or claims.get("appid")) not in ALLOWED_CLIENTS:
+            return None
         return _ident(claims)
     except Exception:
         return None
 
 def _audit(who, tool, cmd, rc, dur, n, oid):
     rec = json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "who": who,
-                      "tool": tool, "cmd": cmd[:500], "rc": rc, "dur": round(dur, 2),
+                      "tool": tool, "cmd": _scrub(cmd), "rc": rc, "dur": round(dur, 2),
                       "out_chars": n, "output_id": oid})
     try:
         with _lock, open(AUDIT, "a") as f:
@@ -181,29 +214,36 @@ def _mutates(argv):
     return False
 
 def _run_capped(argv, env, timeout, cap):
-    """Run the wrapper, capturing AT MOST `cap` bytes of merged stdout+stderr while
-    it runs — the child is SIGKILLed (whole process group) the instant it exceeds
-    the cap, so a runaway download/response can't buffer gigabytes into RAM. Returns
-    (text, rc, capped, timed_out)."""
-    p = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         text=True, start_new_session=True)
-    buf = []; total = [0]; capped = [False]
-    def drain():
+    """Run the wrapper, capturing stdout and stderr on SEPARATE pipes (so the caller
+    keeps the rc==0 -> clean-stdout contract — az writes WARNING/deprecation lines to
+    stderr even on success, and the agent json.loads our stdout). Binary-safe (raw
+    bytes, decoded at the end). Total captured is capped at `cap` BYTES across both
+    streams; the child's whole process group is SIGKILLed the instant it exceeds the
+    cap, so a runaway download/response can't buffer gigabytes into RAM. Returns
+    (stdout, stderr, rc, capped, timed_out)."""
+    p = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         start_new_session=True)  # binary pipes
+    out_buf, err_buf = [], []; total = [0]; capped = [False]; mu = threading.Lock()
+    def drain(stream, buf):
         try:
             while True:
-                chunk = p.stdout.read(65536)
+                chunk = stream.read(65536)
                 if not chunk:
                     break
-                if total[0] < cap:
-                    take = chunk[:cap - total[0]]; buf.append(take); total[0] += len(take)
-                if total[0] >= cap and not capped[0]:
-                    capped[0] = True
-                    try: os.killpg(p.pid, signal.SIGKILL)
-                    except Exception: pass
-                    break
+                with mu:
+                    room = cap - total[0]
+                    if room > 0:
+                        take = chunk[:room]; buf.append(take); total[0] += len(take)
+                    if total[0] >= cap and not capped[0]:
+                        capped[0] = True
+                        try: os.killpg(p.pid, signal.SIGKILL)
+                        except Exception: pass
+                        return
         except Exception:
             pass
-    t = threading.Thread(target=drain, daemon=True); t.start()
+    threads = [threading.Thread(target=drain, args=(s, b), daemon=True)
+               for s, b in ((p.stdout, out_buf), (p.stderr, err_buf))]
+    for t in threads: t.start()
     timed_out = False
     try:
         rc = p.wait(timeout=timeout)
@@ -212,8 +252,9 @@ def _run_capped(argv, env, timeout, cap):
         try: os.killpg(p.pid, signal.SIGKILL)
         except Exception: pass
         p.wait()
-    t.join(timeout=5)
-    return "".join(buf), rc, capped[0], timed_out
+    for t in threads: t.join(timeout=5)
+    return (b"".join(out_buf).decode(errors="replace"),
+            b"".join(err_buf).decode(errors="replace"), rc, capped[0], timed_out)
 
 @mcp.tool()
 def az_run(command: str, ctx: Context) -> str:
@@ -247,6 +288,9 @@ def az_run(command: str, ctx: Context) -> str:
         return json.dumps({"error": "server is in read-only mode (AZOBO_READONLY): this command appears "
                                     "to mutate (a write verb, or rest/invoke with a non-GET method). "
                                     "Only read operations are permitted."})
+    joined = " ".join(argv)
+    if any(joined == d or joined.startswith(d + " ") for d in DENY_CMDS):
+        return json.dumps({"error": "that command is disabled on this server (AZOBO_DENY_COMMANDS)."})
     cfg = tempfile.mkdtemp(prefix="azcfg-"); t0 = time.time()
     # Minimal env — only what the wrapper + Azure CLI need. Avoid leaking the
     # broader process environment (and reduce blast radius) into the subprocess.
@@ -257,11 +301,14 @@ def az_run(command: str, ctx: Context) -> str:
            "AZURE_CONFIG_DIR": cfg, "AZURE_EXTENSION_DIR": os.path.join(cfg, "ext"),
            "AZURE_CORE_DISABLE_DYNAMIC_INSTALL": "yes", "AZURE_CORE_COLLECT_TELEMETRY": "no"}
     try:
-        out, rc, capped, timed_out = _run_capped([VENV_PY, AZOBO] + argv, env, TIMEOUT, MAX_CAPTURE)
+        with (_sem or _nullctx()):
+            so, se, rc, capped, timed_out = _run_capped([VENV_PY, AZOBO] + argv, env, TIMEOUT, MAX_CAPTURE)
         if timed_out:
             out = json.dumps({"error": f"timed out after {TIMEOUT}s — for long ops use --no-wait + poll status"})
         else:
-            out = out.strip() or "(no output)"
+            # Keep the clean contract: on success return stdout only (az writes
+            # warnings to stderr even on rc==0); only fold stderr in on failure.
+            out = (so if rc == 0 else (so + se)).strip() or "(no output)"
             if capped:
                 out += (f"\n\n[…CAPPED: output exceeded {MAX_CAPTURE} bytes and the command was terminated. "
                         "Narrow it with --query / -o tsv / --top, or download to Azure-side storage instead.]")
@@ -299,13 +346,19 @@ def graph_run(path: str, ctx: Context, method: str = "GET", body: str = "", allo
         method=method.upper(), headers={"Authorization": "Bearer " + r["access_token"],
                                         "Content-Type": "application/json"})
     try:
-        resp = urllib.request.urlopen(req, timeout=TIMEOUT)
-        raw = resp.read(MAX_CAPTURE + 1)  # bounded read — don't buffer an unbounded response
+        with (_sem or _nullctx()):
+            resp = urllib.request.urlopen(req, timeout=TIMEOUT)
+            raw = resp.read(MAX_CAPTURE + 1)  # bounded read — don't buffer an unbounded response
         out = raw[:MAX_CAPTURE].decode(errors="replace") or json.dumps({"status": resp.status}); rc = 0
         if len(raw) > MAX_CAPTURE:
             out += f"\n\n[…CAPPED at {MAX_CAPTURE} bytes — narrow with $select/$top/$filter.]"
     except urllib.error.HTTPError as e:
-        out = json.dumps({"status": e.code, "error": json.loads(e.read(MAX_CAPTURE) or b"{}")}); rc = e.code
+        body = e.read(MAX_CAPTURE) or b"{}"
+        try:
+            err = json.loads(body)
+        except Exception:
+            err = {"raw": body.decode(errors="replace")[:1000]}  # non-JSON (e.g. a proxy's HTML 502)
+        out = json.dumps({"status": e.code, "error": err}); rc = e.code
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         out = json.dumps({"error": f"graph request failed: {type(e).__name__}: {str(e)[:160]}"}); rc = -1
     return _finalize(owner, who, "graph_run", f"{method} {path}", out, rc, time.time() - t0)

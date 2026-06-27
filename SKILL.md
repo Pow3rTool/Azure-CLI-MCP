@@ -18,8 +18,10 @@ How to work with it:
   context does not persist between calls. `account list` shows what you can see.
 - **Directory:** prefer `az ad ...` (you know its syntax); `graph_run` for anything `az ad`
   doesn't cover.
-- **Big output is truncated** in the reply but fully saved — if you need the rest, call
-  `read_output(output_id=...)`; better, re-run with a tighter `--query`/`--top`.
+- **Big output is truncated** in the reply but briefly retained in memory — if you need the
+  rest, call `read_output(output_id=...)` soon (it expires); better, re-run with a tighter
+  `--query`/`--top`. Very large output is capped and the command terminated, so prefer
+  narrow queries over dumping everything.
 - **Access is the signed-in user's own RBAC.** `AuthorizationFailed` / 403 / empty outside
   their scope is the permission boundary working as designed — report it plainly, do not
   retry or try to route around it. If they need more, they get the role assigned in Azure.

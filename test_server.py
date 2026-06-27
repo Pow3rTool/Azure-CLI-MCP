@@ -76,6 +76,15 @@ def test_readonly_blocklist_catches_writes_and_rest():
     assert mut(shlex.split('rest --url https://x')) is False  # defaults to GET
 
 
+def test_audit_scrubs_secret_flags():
+    s = server._scrub
+    assert "hunter2" not in s("ad sp credential reset --id x --password hunter2")
+    assert "topsecret" not in s("keyvault secret set --name n --value topsecret")
+    assert "***" in s("keyvault secret set --name n --value topsecret")
+    # non-secret flags are left intact
+    assert "rg-prod" in s("vm list -g rg-prod -o table")
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
