@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Secrets / local config — NEVER commit
+*.env
+.env
+*.key
+*.pem
+*.crt
+*.pfx
+azobo.env
+
+# Local audit / output
+audit.log
+output/
