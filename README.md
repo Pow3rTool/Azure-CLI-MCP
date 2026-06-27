@@ -171,10 +171,41 @@ This server runs the full Azure CLI as the signed-in user; treat it accordingly.
 - **Least privilege:** grant the resource app only the downstream permissions you actually
   need (§1.4), start read-only, and remember the consented permissions are just the
   *ceiling* — effective access is that ceiling ∩ each user's own RBAC.
-- **Optional `AZOBO_READONLY`** forces Graph GET-only and refuses mutating `az` verbs as
-  defense-in-depth (RBAC is still the authoritative boundary).
-- The wrapped CLI runs with `AZURE_CORE_DISABLE_DYNAMIC_INSTALL=yes` so it can't
-  auto-install/run extension code.
+- **Resource ceilings bound a runaway.** The unit sets `LimitFSIZE` (a local write past
+  the cap dies with SIGXFSZ — kills a `az ... download` of a huge blob), `MemoryMax`, and
+  `TasksMax`; the server caps **captured** bytes per command (`AZOBO_MAX_CAPTURE_BYTES`,
+  killing the child if exceeded) and the total bytes retained in memory. A runaway can kill
+  the *service*, not the host.
+- **Egress is fenced off from the host metadata endpoint.** The unit's
+  `IPAddressDeny=169.254.0.0/16 fe80::/10` stops `az rest`/SSRF from reaching IMDS to lift
+  the *host's* managed-identity token. Public Azure endpoints are unaffected; uncomment the
+  RFC1918 ranges to also fence internal networks.
+- **Optional `AZOBO_READONLY`** forces Graph GET-only and refuses mutating `az` verbs —
+  including `rest`/`invoke` with a non-GET method. This is **defense-in-depth, not a policy
+  boundary**: it's a best-effort blocklist, not a command allowlist. For a *real* read-only
+  deployment, assign users only **Reader** RBAC roles and consent the app to read-only
+  scopes — RBAC is the authoritative boundary.
+- The wrapped CLI runs with `AZURE_CORE_DISABLE_DYNAMIC_INSTALL=yes` (no extension code
+  auto-runs) and a **minimal environment** (only the vars the wrapper needs).
+
+### Threat model & the one residual you must accept (or design out)
+
+The boundary this tool relies on is **per-user Azure RBAC**: every call is the signed-in
+user, so it can do only what that user could already do from their own machine. A 403 is
+the boundary working. It is built for **trusted operators**, not anonymous internet users.
+
+The genuine residual: the OBO broker certificate sits on disk readable by the same `azobo`
+user that runs arbitrary `az`, so a malicious caller could `az rest --body @/etc/azobo/obo.key`
+and exfiltrate it. The sandbox stops host takeover but **cannot** hide the key from `az`,
+because the OBO exchange happens *inside* the `az` subprocess (the wrapper reads the key).
+
+The real fix is to **not keep a cert on disk at all**. On Azure, deploy with a **federated
+Managed Identity** (the recommended default): the OBO confidential client authenticates via
+the platform, no key file exists, and there is nothing for `az rest` to read. The next step
+beyond that is a **separate credential-broker process** that mints OBO tokens over a local
+socket so the CLI subprocess never holds broker material — planned, not yet built. Until one
+of those lands, treat the cert as a crown jewel and keep this on a trusted, operator-only
+endpoint.
 
 ## License
 

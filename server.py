@@ -1,4 +1,4 @@
-import os, re, shlex, shutil, subprocess, tempfile, json, time, uuid, base64, threading
+import os, re, shlex, shutil, signal, subprocess, tempfile, json, time, uuid, base64, threading
 import urllib.request, urllib.error, msal
 from collections import OrderedDict
 from mcp.server.fastmcp import Context, FastMCP
@@ -18,10 +18,17 @@ TIMEOUT = int(os.environ.get("AZOBO_TIMEOUT", "150"))
 MAX_OUT = int(os.environ.get("AZOBO_MAX_OUTPUT_CHARS", "100000"))  # ~25k tokens; full output kept in memory
 AUDIT = os.environ.get("AZOBO_AUDIT_LOG", "/var/lib/azobo/audit.log")
 
-# Full command output is retained IN MEMORY only (never written to disk) so a
-# read_output can page it — bounded by count + TTL, evicted oldest-first. Lost on
-# restart by design: it is a retrieval aid, not a record (the audit log is).
+# Hard ceiling on how many bytes we CAPTURE from a single command (stdout+stderr).
+# Enforced WHILE reading — the child is killed once it exceeds this, so a runaway
+# `az ... download` / huge `az rest` response can't buffer gigabytes into RAM before
+# MAX_OUT (which only trims what we RETURN) ever applies.
+MAX_CAPTURE = int(os.environ.get("AZOBO_MAX_CAPTURE_BYTES", str(20 * 1024 * 1024)))  # 20 MB
+
+# Full captured output is retained IN MEMORY only (never written to disk) so a
+# read_output can page it — bounded by entry count, TOTAL bytes, and TTL; evicted
+# oldest-first. Lost on restart by design: a retrieval aid, not a record (audit is).
 OUT_MAX = int(os.environ.get("AZOBO_OUTPUT_MAX_ENTRIES", "300"))
+OUT_MAX_BYTES = int(os.environ.get("AZOBO_OUTPUT_MAX_BYTES", str(100 * 1024 * 1024)))  # 100 MB total
 OUT_TTL = int(os.environ.get("AZOBO_OUTPUT_TTL_SECONDS", "1800"))
 
 # Server-enforced read-only mode (defense-in-depth ON TOP OF per-user RBAC, which
@@ -132,14 +139,17 @@ def _audit(who, tool, cmd, rc, dur, n, oid):
         pass
 
 def _store(who, out):
-    """Retain full output in memory (owner-stamped), evicting expired + oldest."""
+    """Retain captured output in memory (owner-stamped), evicting expired, then
+    oldest until BOTH the entry-count and total-byte budgets are satisfied."""
     oid = uuid.uuid4().hex[:12]; now = time.time()
     with _lock:
         _outputs[oid] = (who, out, now)
         for k in [k for k, (_o, _t, ts) in _outputs.items() if now - ts > OUT_TTL]:
             _outputs.pop(k, None)
-        while len(_outputs) > OUT_MAX:
-            _outputs.popitem(last=False)
+        total = sum(len(v[1]) for v in _outputs.values())
+        while _outputs and (len(_outputs) > OUT_MAX or total > OUT_MAX_BYTES):
+            _k, (_o, _t, _ts) = _outputs.popitem(last=False)
+            total -= len(_t)
     return oid
 
 def _finalize(owner, who, tool, cmd, out, rc, dur):
@@ -151,6 +161,59 @@ def _finalize(owner, who, tool, cmd, out, rc, dur):
     return out[:MAX_OUT] + (f"\n\n[…TRUNCATED: returned {MAX_OUT} of {len(out)} chars. Full output "
         f"held in memory as output_id='{oid}' (expires in ~{OUT_TTL // 60}m). Read the rest with "
         f"read_output(output_id='{oid}', offset={MAX_OUT}), or re-run with a narrower --query / -o tsv / --top.]")
+
+def _mutates(argv):
+    """Best-effort 'does this az command write?' for read-only mode. Catches the
+    verb set AND `rest`/`invoke` with a non-GET --method (the hole a plain verb
+    check misses — `az rest --method POST` is a write that no verb token reveals).
+    Defense-in-depth only; per-user RBAC is the authoritative boundary."""
+    if any(t in _MUTATING for t in argv):
+        return True
+    if argv and argv[0] in ("rest", "invoke"):
+        m = "GET"
+        for i, t in enumerate(argv):
+            if t in ("--method", "-m") and i + 1 < len(argv):
+                m = argv[i + 1]
+            elif t.startswith("--method="):
+                m = t.split("=", 1)[1]
+        if m.upper() != "GET":
+            return True
+    return False
+
+def _run_capped(argv, env, timeout, cap):
+    """Run the wrapper, capturing AT MOST `cap` bytes of merged stdout+stderr while
+    it runs — the child is SIGKILLed (whole process group) the instant it exceeds
+    the cap, so a runaway download/response can't buffer gigabytes into RAM. Returns
+    (text, rc, capped, timed_out)."""
+    p = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, start_new_session=True)
+    buf = []; total = [0]; capped = [False]
+    def drain():
+        try:
+            while True:
+                chunk = p.stdout.read(65536)
+                if not chunk:
+                    break
+                if total[0] < cap:
+                    take = chunk[:cap - total[0]]; buf.append(take); total[0] += len(take)
+                if total[0] >= cap and not capped[0]:
+                    capped[0] = True
+                    try: os.killpg(p.pid, signal.SIGKILL)
+                    except Exception: pass
+                    break
+        except Exception:
+            pass
+    t = threading.Thread(target=drain, daemon=True); t.start()
+    timed_out = False
+    try:
+        rc = p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True; rc = -1
+        try: os.killpg(p.pid, signal.SIGKILL)
+        except Exception: pass
+        p.wait()
+    t.join(timeout=5)
+    return "".join(buf), rc, capped[0], timed_out
 
 @mcp.tool()
 def az_run(command: str, ctx: Context) -> str:
@@ -180,20 +243,28 @@ def az_run(command: str, ctx: Context) -> str:
     if any(t in ("--follow", "--watch") for t in argv):
         return json.dumps({"error": "--follow/--watch never return here. Fetch a bounded snapshot "
                                     "(e.g. --lines N) or use --no-wait + poll."})
-    if READONLY and any(t in _MUTATING for t in argv):
+    if READONLY and _mutates(argv):
         return json.dumps({"error": "server is in read-only mode (AZOBO_READONLY): this command appears "
-                                    "to mutate. Only read operations (list/show/get/...) are permitted."})
-    cfg = tempfile.mkdtemp(prefix="azcfg-"); t0 = time.time(); rc = -1
+                                    "to mutate (a write verb, or rest/invoke with a non-GET method). "
+                                    "Only read operations are permitted."})
+    cfg = tempfile.mkdtemp(prefix="azcfg-"); t0 = time.time()
+    # Minimal env — only what the wrapper + Azure CLI need. Avoid leaking the
+    # broader process environment (and reduce blast radius) into the subprocess.
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+           "HOME": cfg, "LANG": os.environ.get("LANG", "C.UTF-8"),
+           "AZOBO_ASSERTION": a, "AZOBO_CLIENT_ID": CLIENT, "AZOBO_KEY": KEY, "AZOBO_CERT": CERT,
+           "AZOBO_THUMB": THUMB, "AZURE_TENANT_ID": TENANT, "AZURE_SUBSCRIPTION_ID": DEFAULT_SUB,
+           "AZURE_CONFIG_DIR": cfg, "AZURE_EXTENSION_DIR": os.path.join(cfg, "ext"),
+           "AZURE_CORE_DISABLE_DYNAMIC_INSTALL": "yes", "AZURE_CORE_COLLECT_TELEMETRY": "no"}
     try:
-        env = dict(os.environ, AZOBO_ASSERTION=a, AZOBO_CLIENT_ID=CLIENT, AZOBO_KEY=KEY, AZOBO_CERT=CERT,
-                   AZOBO_THUMB=THUMB, AZURE_TENANT_ID=TENANT, AZURE_SUBSCRIPTION_ID=DEFAULT_SUB,
-                   AZURE_CONFIG_DIR=cfg, AZURE_EXTENSION_DIR=os.path.join(cfg, "ext"),
-                   AZURE_CORE_DISABLE_DYNAMIC_INSTALL="yes", AZURE_CORE_COLLECT_TELEMETRY="no")
-        r = subprocess.run([VENV_PY, AZOBO] + argv, env=env, capture_output=True, text=True, timeout=TIMEOUT)
-        rc = r.returncode
-        out = (r.stdout if rc == 0 else (r.stdout + r.stderr)).strip() or "(no output)"
-    except subprocess.TimeoutExpired:
-        out = json.dumps({"error": f"timed out after {TIMEOUT}s — for long ops use --no-wait + poll status"})
+        out, rc, capped, timed_out = _run_capped([VENV_PY, AZOBO] + argv, env, TIMEOUT, MAX_CAPTURE)
+        if timed_out:
+            out = json.dumps({"error": f"timed out after {TIMEOUT}s — for long ops use --no-wait + poll status"})
+        else:
+            out = out.strip() or "(no output)"
+            if capped:
+                out += (f"\n\n[…CAPPED: output exceeded {MAX_CAPTURE} bytes and the command was terminated. "
+                        "Narrow it with --query / -o tsv / --top, or download to Azure-side storage instead.]")
     finally:
         shutil.rmtree(cfg, ignore_errors=True)
     return _finalize(owner, who, "az_run", command, out, rc, time.time() - t0)
@@ -229,9 +300,12 @@ def graph_run(path: str, ctx: Context, method: str = "GET", body: str = "", allo
                                         "Content-Type": "application/json"})
     try:
         resp = urllib.request.urlopen(req, timeout=TIMEOUT)
-        out = resp.read().decode() or json.dumps({"status": resp.status}); rc = 0
+        raw = resp.read(MAX_CAPTURE + 1)  # bounded read — don't buffer an unbounded response
+        out = raw[:MAX_CAPTURE].decode(errors="replace") or json.dumps({"status": resp.status}); rc = 0
+        if len(raw) > MAX_CAPTURE:
+            out += f"\n\n[…CAPPED at {MAX_CAPTURE} bytes — narrow with $select/$top/$filter.]"
     except urllib.error.HTTPError as e:
-        out = json.dumps({"status": e.code, "error": json.loads(e.read() or b"{}")}); rc = e.code
+        out = json.dumps({"status": e.code, "error": json.loads(e.read(MAX_CAPTURE) or b"{}")}); rc = e.code
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         out = json.dumps({"error": f"graph request failed: {type(e).__name__}: {str(e)[:160]}"}); rc = -1
     return _finalize(owner, who, "graph_run", f"{method} {path}", out, rc, time.time() - t0)

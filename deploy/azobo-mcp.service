@@ -43,6 +43,25 @@ AmbientCapabilities=
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
+# --- resource ceilings (a runaway can only kill the SERVICE, not the host) -----
+# Any local write past this dies with SIGXFSZ — bounds a `az ... download` of a
+# 600 GB blob, and large file-exfil writes, regardless of the 150s timeout.
+LimitFSIZE=268435456
+# Cap RAM so a huge response / many concurrent calls OOM only this unit.
+MemoryMax=2G
+MemoryHigh=1500M
+# Bound process/thread fan-out.
+TasksMax=64
+LimitNPROC=128
+
+# --- egress: block the host metadata endpoint + link-local ---------------------
+# Stops `az rest`/SSRF from reaching IMDS (169.254.169.254) to lift the HOST's
+# managed-identity token, or other link-local services. Public Azure endpoints
+# (login.microsoftonline.com, management.azure.com, graph) are unaffected. To also
+# fence off internal networks, add the RFC1918 ranges you don't need to reach.
+IPAddressDeny=169.254.0.0/16 fe80::/10
+# IPAddressDeny=10.0.0.0/8 172.16.0.0/12 192.168.0.0/16   # uncomment if not using private endpoints
+
 # Belt-and-suspenders: stop the wrapped Azure CLI auto-installing/running
 # extension code, and silence telemetry.
 Environment=AZURE_CORE_DISABLE_DYNAMIC_INSTALL=yes
