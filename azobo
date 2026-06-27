@@ -1,0 +1,60 @@
+import os, sys, time, json, base64, datetime, urllib.request, msal
+from azure.cli.core import _profile
+from azure.core.credentials import AccessToken
+
+TENANT=os.environ["AZURE_TENANT_ID"]; CLIENT=os.environ["AZOBO_CLIENT_ID"]
+_app = msal.ConfidentialClientApplication(CLIENT, authority=f"https://login.microsoftonline.com/{TENANT}",
+    client_credential={"private_key": open(os.environ["AZOBO_KEY"]).read(),
+                       "thumbprint": os.environ["AZOBO_THUMB"],
+                       "public_certificate": open(os.environ["AZOBO_CERT"]).read()})
+_assertion = os.environ["AZOBO_ASSERTION"]
+
+def _obo(scopes):
+    r = _app.acquire_token_on_behalf_of(user_assertion=_assertion, scopes=list(scopes))
+    if "access_token" not in r:
+        raise Exception(f"OBO failed for {list(scopes)}: {r.get('error')}: {str(r.get('error_description'))[:120]}")
+    return r["access_token"]
+
+def _exp(t):
+    try:
+        p=t.split('.')[1]; p+='='*(-len(p)%4); return int(json.loads(base64.urlsafe_b64decode(p)).get('exp',time.time()+3000))
+    except Exception: return int(time.time()+3000)
+
+class OboCred:
+    def get_token(self,*s,**k): t=_obo(s); return AccessToken(t,_exp(t))
+    def get_token_info(self,*s,**k):
+        from azure.core.credentials import AccessTokenInfo
+        t=_obo(s); return AccessTokenInfo(t,_exp(t))
+
+_subs=None
+def _load_subs(self, all_clouds=False, **k):
+    global _subs
+    if _subs is None:
+        tok=_obo(["https://management.core.windows.net//.default"])
+        req=urllib.request.Request("https://management.azure.com/subscriptions?api-version=2020-01-01", headers={"Authorization":"Bearer "+tok})
+        vals=json.loads(urllib.request.urlopen(req,timeout=20).read()).get("value",[])
+        dflt=os.environ.get("AZURE_SUBSCRIPTION_ID")
+        _subs=[{"id":s["subscriptionId"],"name":s.get("displayName","sub"),"state":s.get("state","Enabled"),
+                "tenantId":s.get("tenantId",TENANT),"isDefault":(s["subscriptionId"]==dflt),
+                "environmentName":"AzureCloud","homeTenantId":TENANT,"managedByTenants":[],
+                "user":{"name":"obo","type":"user"}} for s in vals]
+        if _subs and not any(x["isDefault"] for x in _subs): _subs[0]["isDefault"]=True
+    return _subs
+
+def _raw(self, resource=None, scopes=None, subscription=None, tenant=None, credential_out=None):
+    if resource and not scopes:
+        from azure.cli.core.auth.util import resource_to_scopes
+        scopes = resource_to_scopes(resource)
+    if not scopes:
+        scopes = ["https://management.core.windows.net//.default"]
+    tok=_obo(scopes); exp=_exp(tok)
+    te={"accessToken":tok,"expires_on":exp,"expiresOn":datetime.datetime.fromtimestamp(exp).strftime("%Y-%m-%d %H:%M:%S.%f")}
+    return (("Bearer", tok, te), subscription or os.environ.get("AZURE_SUBSCRIPTION_ID"), tenant or TENANT)
+
+if os.environ.get("AZOBO_ASSERTION"):
+    _profile.Profile.get_login_credentials = (lambda self, resource=None, subscription_id=None, *a, **k: (OboCred(), subscription_id or os.environ.get("AZURE_SUBSCRIPTION_ID"), TENANT))
+    _profile.Profile.load_cached_subscriptions = _load_subs
+    _profile.Profile.get_raw_token = _raw
+
+from azure.cli.core import get_default_cli
+sys.exit(get_default_cli().invoke(sys.argv[1:]))
