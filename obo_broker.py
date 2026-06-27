@@ -8,11 +8,15 @@ broker over a local Unix socket and ask it to mint OBO tokens; the cert never
 leaves this process and the user assertion never reaches the CLI subprocess.
 
 Protocol — newline-delimited JSON over the socket, one request → one response:
-  {"op":"register","assertion":"<jwt>"}        -> {"session":"<id>"}      (server only)
+  {"op":"register","assertion":"<jwt>"}        -> {"session":"<id>"}   (broker VALIDATES the assertion)
   {"op":"mint","session":"<id>","scopes":[…]}  -> {"token":"…","expires_on":N}
-  {"op":"mint_assertion","assertion":"<jwt>","scopes":[…]} -> {"token":…}  (server only)
   {"op":"end","session":"<id>"}                -> {"ok":true}
 errors -> {"error":"…"}
+
+The socket is reachable by anything in the shared `azobo` group, so the broker does
+not assume a trusted caller: `register` validates the assertion itself, and `mint`
+requires a 128-bit session id it can't guess. (There is intentionally no
+mint-by-raw-assertion op — minting always goes through a registered session.)
 
 Why sessions: the server holds the user's bearer; it registers a session and
 hands the `az` subprocess only an opaque, short-lived session id — so the
@@ -30,6 +34,15 @@ THUMB = os.environ["AZOBO_CERT_THUMBPRINT"]
 SOCKET_PATH = os.environ.get("AZOBO_BROKER_SOCKET", "/run/azobo/broker.sock")
 SESSION_TTL = int(os.environ.get("AZOBO_SESSION_TTL", "300"))
 
+# The broker is the credential boundary, so it validates assertions ITSELF at
+# register (signature via tenant JWKS, audience, issuer, scope, client allow-list)
+# — not relying on the MCP server having done so. Defense in depth: even a direct
+# socket caller can't register a forged/out-of-policy assertion.
+VALIDATE = os.environ.get("AZOBO_VALIDATE_TOKENS", "true").lower() in ("1", "true", "yes")
+AUDIENCE = [x for x in (CLIENT, f"api://{CLIENT}", os.environ.get("AZOBO_AUDIENCE", "")) if x]
+REQUIRED_SCOPE = os.environ.get("AZOBO_REQUIRED_SCOPE", "").strip()
+ALLOWED_CLIENTS = [x.strip() for x in os.environ.get("AZOBO_ALLOWED_CLIENTS", "").split(",") if x.strip()]
+
 _sessions = {}          # session_id -> (assertion, expiry_ts)
 _lock = threading.Lock()
 _app = None             # MSAL confidential client (holds the cert) — built lazily
@@ -46,6 +59,35 @@ def _get_app():
                                "public_certificate": open(CERT).read()})
     return _app
 
+
+_jwks = None
+def _jwks_client():
+    global _jwks
+    if _jwks is None:
+        from jwt import PyJWKClient
+        _jwks = PyJWKClient(f"https://login.microsoftonline.com/{TENANT}/discovery/v2.0/keys")
+    return _jwks
+
+def _valid_assertion(assertion):
+    """Verify an assertion is a real Entra token for this tenant+app+scope+client
+    before we'll register a session for it. (Patched in tests.)"""
+    if not VALIDATE:
+        return True
+    try:
+        import jwt
+        key = _jwks_client().get_signing_key_from_jwt(assertion).key
+        claims = jwt.decode(assertion, key, algorithms=["RS256"], audience=AUDIENCE,
+                            options={"require": ["exp"], "verify_aud": True})
+        if claims.get("iss", "") not in (f"https://login.microsoftonline.com/{TENANT}/v2.0",
+                                          f"https://sts.windows.net/{TENANT}/"):
+            return False
+        if REQUIRED_SCOPE and REQUIRED_SCOPE not in str(claims.get("scp", "")).split():
+            return False
+        if ALLOWED_CLIENTS and (claims.get("azp") or claims.get("appid")) not in ALLOWED_CLIENTS:
+            return False
+        return True
+    except Exception:
+        return False
 
 def _mint(assertion, scopes):
     """Do the OBO exchange. Raises on failure. (Patched in tests.)
@@ -78,6 +120,8 @@ def handle_request(req):
         a = req.get("assertion") or ""
         if not a:
             return {"error": "assertion required"}
+        if not _valid_assertion(a):
+            return {"error": "assertion failed validation (signature/audience/issuer/scope/client)"}
         sid = secrets.token_hex(16)
         with _lock:
             _reap(now)
@@ -94,10 +138,6 @@ def handle_request(req):
         if not v:
             return {"error": "unknown or expired session"}
         assertion = v[0]
-    elif op == "mint_assertion":
-        assertion = req.get("assertion") or ""
-        if not assertion:
-            return {"error": "assertion required"}
     else:
         return {"error": f"unknown op {op!r}"}
     scopes = req.get("scopes") or []

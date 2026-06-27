@@ -12,6 +12,7 @@ os.environ.setdefault("AZOBO_CLIENT_ID", "11111111-1111-1111-1111-111111111111")
 os.environ.setdefault("AZOBO_CERT_THUMBPRINT", "AABB")
 os.environ.setdefault("AZOBO_CERT_KEY", "/dev/null")
 os.environ.setdefault("AZOBO_CERT_PUB", "/dev/null")
+os.environ["AZOBO_VALIDATE_TOKENS"] = "false"  # don't JWKS-validate the dummy assertions here
 
 import obo_broker  # noqa: E402
 
@@ -42,9 +43,9 @@ def test_mint_requires_scopes():
     assert "error" in obo_broker.handle_request({"op": "mint", "session": sid, "scopes": []})
 
 
-def test_mint_assertion_direct():
-    m = obo_broker.handle_request({"op": "mint_assertion", "assertion": "DIRECT", "scopes": ["s2"]})
-    assert m["token"] == "tok::DIRECT::s2"
+def test_no_mint_by_raw_assertion():
+    # the mint-by-raw-assertion op was removed; minting is session-only.
+    assert "error" in obo_broker.handle_request({"op": "mint_assertion", "assertion": "X", "scopes": ["s"]})
 
 
 def test_session_expiry_reaped():

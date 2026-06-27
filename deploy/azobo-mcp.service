@@ -26,6 +26,10 @@ UMask=0077
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/var/lib/azobo
+# Defense against a perms mistake: the cert + broker env are the BROKER's, never
+# the server's — make them literally unreadable from this service (and its `az`
+# children), regardless of file mode.
+InaccessiblePaths=/etc/azobo/obo.key /etc/azobo/broker.env
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectProc=invisible

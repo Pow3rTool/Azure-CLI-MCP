@@ -50,10 +50,16 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 MemoryMax=512M
-TasksMax=32
+# Thread-per-connection; one `az` command makes several mint round-trips, so keep
+# headroom WELL above the server's AZOBO_MAX_CONCURRENCY (see azobo.env).
+TasksMax=256
+LimitCORE=0          # no core dumps — a dump would contain the cert/tokens in memory
 # Block IMDS/link-local (broker only needs public Entra). Verify it's enforced:
 #   systemctl show azobo-broker -p IPAddressDeny
 IPAddressDeny=169.254.0.0/16 fe80::/10
+# NOTE: the socket's only access control is membership in the `azobo` group. Keep
+# that group to EXACTLY the broker + server service users — anything else added to
+# it can register/mint for any assertion it can present.
 
 [Install]
 WantedBy=multi-user.target
