@@ -64,8 +64,11 @@ DENY_CMDS = [x.strip() for x in os.environ.get("AZOBO_DENY_COMMANDS", "").split(
 # China, etc.) add their own suffixes via AZOBO_REST_ALLOWED_DOMAINS.
 _DEFAULT_REST_DOMAINS = ("microsoft.com,microsoftonline.com,windows.net,"
                          "azure.com,azure.net")
-REST_ALLOWED = [d.strip().lower() for d in
-                os.environ.get("AZOBO_REST_ALLOWED_DOMAINS", _DEFAULT_REST_DOMAINS).split(",") if d.strip()]
+# A blank/unset value falls back to the default — so copying a blank example can't
+# silently DISABLE the exfil guard. To deliberately opt out, set it to "*".
+_rest_env = os.environ.get("AZOBO_REST_ALLOWED_DOMAINS", "").strip()
+REST_ALLOWED = ([] if _rest_env == "*" else
+                [d.strip().lower() for d in (_rest_env or _DEFAULT_REST_DOMAINS).split(",") if d.strip()])
 
 # Optional concurrency cap (backstop alongside MemoryMax). 0 = unlimited.
 MAX_CONC = int(os.environ.get("AZOBO_MAX_CONCURRENCY", "0"))

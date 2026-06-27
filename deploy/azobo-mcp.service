@@ -60,6 +60,9 @@ MemoryHigh=1500M
 # Bound process/thread fan-out.
 TasksMax=64
 LimitNPROC=128
+# No core dumps — this process holds the user bearer, minted tokens in transit, and
+# the in-memory output store (which can contain a Key Vault secret a user just read).
+LimitCORE=0
 
 # --- egress: block the host metadata endpoint + link-local ---------------------
 # Stops `az rest`/SSRF from reaching IMDS (169.254.169.254) to lift the HOST's

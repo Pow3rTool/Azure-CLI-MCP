@@ -53,7 +53,8 @@ MemoryMax=512M
 # Thread-per-connection; one `az` command makes several mint round-trips, so keep
 # headroom WELL above the server's AZOBO_MAX_CONCURRENCY (see azobo.env).
 TasksMax=256
-LimitCORE=0          # no core dumps — a dump would contain the cert/tokens in memory
+# No core dumps — a dump would contain the cert + minted tokens from memory.
+LimitCORE=0
 # Block IMDS/link-local (broker only needs public Entra). Verify it's enforced:
 #   systemctl show azobo-broker -p IPAddressDeny
 IPAddressDeny=169.254.0.0/16 fe80::/10
