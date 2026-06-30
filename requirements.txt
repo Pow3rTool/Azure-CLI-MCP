@@ -2,4 +2,4 @@ azure-cli==2.87.0
 msal==1.36.0
 cryptography==48.0.1
 mcp==1.28.1
-PyJWT==2.10.1
+PyJWT==2.13.0
