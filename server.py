@@ -42,6 +42,16 @@ READONLY = os.environ.get("AZOBO_READONLY", "").lower() in ("1", "true", "yes")
 VALIDATE = os.environ.get("AZOBO_VALIDATE_TOKENS", "true").lower() in ("1", "true", "yes")
 AUDIENCE = [x for x in (CLIENT, f"api://{CLIENT}", os.environ.get("AZOBO_AUDIENCE", "")) if x]
 
+# Fail CLOSED: do not run with token validation OFF unless an operator EXPLICITLY
+# acknowledges the insecure/dev posture (mirrors Orthanc's production OBO guard).
+# "Off" trusts unsigned JWT payloads verbatim — lab / trusted-network only, never a
+# silent default that a copied env could land in.
+if not VALIDATE and os.environ.get("AZOBO_ALLOW_INSECURE", "").lower() not in ("1", "true", "yes"):
+    raise SystemExit(
+        "refusing to start: AZOBO_VALIDATE_TOKENS is off, which would trust unverified "
+        "bearer payloads. Set AZOBO_VALIDATE_TOKENS=true, or (dev/lab only) explicitly "
+        "acknowledge the insecure posture with AZOBO_ALLOW_INSECURE=1.")
+
 # Caller authorization (beyond aud/iss/exp). Multi-client tenants: a token another
 # client obtains for THIS resource app would otherwise pass. Set these in prod.
 REQUIRED_SCOPE = os.environ.get("AZOBO_REQUIRED_SCOPE", "").strip()
@@ -239,11 +249,41 @@ def _finalize(owner, who, tool, cmd, out, rc, dur):
         f"held in memory as output_id='{oid}' (expires in ~{OUT_TTL // 60}m). Read the rest with "
         f"read_output(output_id='{oid}', offset={MAX_OUT}), or re-run with a narrower --query / -o tsv / --top.]")
 
+# Azure CLI GLOBAL options: they can appear ANYWHERE (incl. BEFORE the command
+# group) and only affect formatting/verbosity/scope — never WHICH command runs.
+# The option names are reserved globally, so no subcommand redefines them. We strip
+# them (and the values of the value-taking ones) before gating, so a caller can't
+# hide the real command behind a global to dodge an argv[0]/joined-prefix check
+# (e.g. `az --debug rest …`, `az -o json account get-access-token`). We still RUN
+# the caller's original argv — this only canonicalizes what the security gates see.
+_GLOBAL_FLAG_OPTS = {"--debug", "--verbose", "--only-show-errors", "-h", "--help"}
+_GLOBAL_VALUE_OPTS = {"--output", "-o", "--query", "--subscription"}
+_GLOBAL_VALUE_PREFIXES = ("--output=", "-o=", "--query=", "--subscription=")
+
+def _canon_argv(argv):
+    """argv with Azure CLI global options (and their values) removed — the form the
+    security gates key on. See _GLOBAL_* above."""
+    out, i, n = [], 0, len(argv)
+    while i < n:
+        t = argv[i]
+        if t in _GLOBAL_FLAG_OPTS:
+            i += 1
+        elif t in _GLOBAL_VALUE_OPTS:
+            i += 2  # drop the option AND its value
+        elif t.startswith(_GLOBAL_VALUE_PREFIXES):
+            i += 1  # `--opt=value` form: single token
+        else:
+            out.append(t)
+            i += 1
+    return out
+
 def _mutates(argv):
     """Best-effort 'does this az command write?' for read-only mode. Catches the
     verb set AND `rest`/`invoke` with a non-GET --method (the hole a plain verb
     check misses — `az rest --method POST` is a write that no verb token reveals).
-    Defense-in-depth only; per-user RBAC is the authoritative boundary."""
+    Expects a CANONICALIZED argv (see _canon_argv) so a global-flag prefix can't
+    push the real group out of argv[0]. Defense-in-depth only; per-user RBAC is the
+    authoritative boundary."""
     if any(t in _MUTATING for t in argv):
         return True
     if argv and argv[0] in ("rest", "invoke"):
@@ -322,21 +362,24 @@ def az_run(command: str, ctx: Context) -> str:
         argv = shlex.split(command)
     except ValueError as e:
         return json.dumps({"error": f"could not parse command: {e}"})
-    if argv and argv[0] in ("interactive", "ssh"):
-        return json.dumps({"error": f"`az {argv[0]}` is interactive/never-returns and is not supported here. "
+    # Gate on the CANONICAL command (global options stripped) so a prefixed/interleaved
+    # global flag can't slip a command past an argv[0]/joined check. We still RUN argv.
+    cargv = _canon_argv(argv)
+    if cargv and cargv[0] in ("interactive", "ssh"):
+        return json.dumps({"error": f"`az {cargv[0]}` is interactive/never-returns and is not supported here. "
                                     "Use --no-wait + poll, or a bounded query."})
     if any(t in ("--follow", "--watch") for t in argv):
         return json.dumps({"error": "--follow/--watch never return here. Fetch a bounded snapshot "
                                     "(e.g. --lines N) or use --no-wait + poll."})
-    if READONLY and _mutates(argv):
+    if READONLY and _mutates(cargv):
         return json.dumps({"error": "server is in read-only mode (AZOBO_READONLY): this command appears "
                                     "to mutate (a write verb, or rest/invoke with a non-GET method). "
                                     "Only read operations are permitted."})
-    joined = " ".join(argv)
+    joined = " ".join(cargv)
     if any(joined == d or joined.startswith(d + " ") for d in DENY_CMDS):
         return json.dumps({"error": "that command is disabled on this server (AZOBO_DENY_COMMANDS)."})
-    if argv and argv[0] in ("rest", "invoke"):
-        ok, host = _rest_host_ok(argv)
+    if cargv and cargv[0] in ("rest", "invoke"):
+        ok, host = _rest_host_ok(cargv)
         if not ok:
             return json.dumps({"error": f"az rest is restricted to Microsoft/Azure endpoints; host {host!r} "
                 "is not allowed. OBO tokens are only valid at Microsoft first-party services — targeting "

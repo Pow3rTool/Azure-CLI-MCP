@@ -39,6 +39,14 @@ SESSION_TTL = int(os.environ.get("AZOBO_SESSION_TTL", "300"))
 # — not relying on the MCP server having done so. Defense in depth: even a direct
 # socket caller can't register a forged/out-of-policy assertion.
 VALIDATE = os.environ.get("AZOBO_VALIDATE_TOKENS", "true").lower() in ("1", "true", "yes")
+# Fail CLOSED: the broker mints real OBO tokens, so running it with validation OFF
+# would let a direct socket caller register a forged assertion. Refuse unless the
+# insecure/dev posture is explicitly acknowledged (mirrors server.py + Orthanc).
+if not VALIDATE and os.environ.get("AZOBO_ALLOW_INSECURE", "").lower() not in ("1", "true", "yes"):
+    raise SystemExit(
+        "refusing to start: AZOBO_VALIDATE_TOKENS is off — the credential broker would "
+        "mint tokens for unverified assertions. Set AZOBO_VALIDATE_TOKENS=true, or "
+        "(dev/lab only) acknowledge with AZOBO_ALLOW_INSECURE=1.")
 AUDIENCE = [x for x in (CLIENT, f"api://{CLIENT}", os.environ.get("AZOBO_AUDIENCE", "")) if x]
 REQUIRED_SCOPE = os.environ.get("AZOBO_REQUIRED_SCOPE", "").strip()
 ALLOWED_CLIENTS = [x.strip() for x in os.environ.get("AZOBO_ALLOWED_CLIENTS", "").split(",") if x.strip()]
