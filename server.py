@@ -97,27 +97,62 @@ _SECRET_FLAG = re.compile(
 def _scrub(cmd):
     return _SECRET_FLAG.sub(lambda m: m.group(1) + "***", cmd or "")[:500]
 
-def _rest_host_ok(argv):
-    """For `rest`/`invoke`: extract the --url/--uri host and check it against the
-    Microsoft/Azure allow-list. Returns (ok, host). ok when the guard is explicitly
-    disabled (AZOBO_REST_ALLOWED_DOMAINS="*" → REST_ALLOWED empty)."""
-    if not REST_ALLOWED:
-        return True, ""
-    url = None
-    for i, t in enumerate(argv):
-        if t in ("--url", "--uri", "-u") and i + 1 < len(argv):
-            url = argv[i + 1]
-        elif t.startswith(("--url=", "--uri=")):
-            url = t.split("=", 1)[1]
-    if not url:
-        return False, "(no --url)"
+# ---------------------------------------------------------------------------
+# Command gating by SCANNING THE WHOLE argv for danger signals — never by trying
+# to strip/normalize Azure CLI global options. `az` accepts globals in any
+# position AND abbreviated (`az --deb rest …` == `--debug`, confirmed on 2.87.0),
+# and can add new globals in future releases — so any "find the real command by
+# removing known globals" approach is inherently leaky. Scanning for the signals
+# themselves (the --url host, a non-GET --method, mutating verbs, denied phrases)
+# is immune to flag position, abbreviation, and future globals. It errs toward
+# reject: a false positive only ever REFUSES a command, it can never leak.
+# ---------------------------------------------------------------------------
+def _host_of(url):
     try:
         from urllib.parse import urlparse
-        host = (urlparse(url).hostname or "").lower()
+        return (urlparse(url).hostname or "").lower()
     except Exception:
-        host = ""
-    ok = bool(host) and any(host == d or host.endswith("." + d) for d in REST_ALLOWED)
-    return ok, host
+        return ""
+
+def _host_allowed(host):
+    return bool(host) and any(host == d or host.endswith("." + d) for d in REST_ALLOWED)
+
+def _url_host(argv):
+    """Host of the first --url/--uri (any position; `=` or space form) anywhere in
+    argv, or None if no url flag is present ("" if present-but-unparseable). `-u` is
+    honored ONLY for rest/invoke (elsewhere `-u` is commonly --username)."""
+    restish = ("rest" in argv) or ("invoke" in argv)
+    flags = ("--url", "--uri", "-u") if restish else ("--url", "--uri")
+    prefixes = ("--url=", "--uri=", "-u=") if restish else ("--url=", "--uri=")
+    for i, t in enumerate(argv):
+        if t in flags and i + 1 < len(argv):
+            return _host_of(argv[i + 1])
+        if t.startswith(prefixes):
+            return _host_of(t.split("=", 1)[1])
+    return None
+
+def _method_nonget(argv):
+    """True if a --method/-m (any position; `=` or space form) is present and not
+    GET. Only rest/invoke take --method, so this is the rest/invoke *write* signal —
+    position- and abbreviation-independent."""
+    m = "GET"
+    for i, t in enumerate(argv):
+        if t in ("--method", "-m") and i + 1 < len(argv):
+            m = argv[i + 1]
+        elif t.startswith(("--method=", "-m=")):
+            m = t.split("=", 1)[1]
+    return m.strip().upper() != "GET"
+
+def _deny_hit(argv):
+    """A DENY_CMDS entry present as an ORDER-PRESERVING SUBSEQUENCE of argv — so an
+    interleaved/prefixed global (`-o json account get-access-token`) can't dodge it."""
+    for d in DENY_CMDS:
+        needles = d.split()
+        if needles:
+            it = iter(argv)
+            if all(n in it for n in needles):
+                return True
+    return False
 
 # Azure CLI verbs that mutate — refused in read-only mode. Best-effort (the CLI
 # has no clean read/write taxonomy); RBAC remains the authoritative boundary.
@@ -249,53 +284,14 @@ def _finalize(owner, who, tool, cmd, out, rc, dur):
         f"held in memory as output_id='{oid}' (expires in ~{OUT_TTL // 60}m). Read the rest with "
         f"read_output(output_id='{oid}', offset={MAX_OUT}), or re-run with a narrower --query / -o tsv / --top.]")
 
-# Azure CLI GLOBAL options: they can appear ANYWHERE (incl. BEFORE the command
-# group) and only affect formatting/verbosity/scope — never WHICH command runs.
-# The option names are reserved globally, so no subcommand redefines them. We strip
-# them (and the values of the value-taking ones) before gating, so a caller can't
-# hide the real command behind a global to dodge an argv[0]/joined-prefix check
-# (e.g. `az --debug rest …`, `az -o json account get-access-token`). We still RUN
-# the caller's original argv — this only canonicalizes what the security gates see.
-_GLOBAL_FLAG_OPTS = {"--debug", "--verbose", "--only-show-errors", "-h", "--help"}
-_GLOBAL_VALUE_OPTS = {"--output", "-o", "--query", "--subscription"}
-_GLOBAL_VALUE_PREFIXES = ("--output=", "-o=", "--query=", "--subscription=")
-
-def _canon_argv(argv):
-    """argv with Azure CLI global options (and their values) removed — the form the
-    security gates key on. See _GLOBAL_* above."""
-    out, i, n = [], 0, len(argv)
-    while i < n:
-        t = argv[i]
-        if t in _GLOBAL_FLAG_OPTS:
-            i += 1
-        elif t in _GLOBAL_VALUE_OPTS:
-            i += 2  # drop the option AND its value
-        elif t.startswith(_GLOBAL_VALUE_PREFIXES):
-            i += 1  # `--opt=value` form: single token
-        else:
-            out.append(t)
-            i += 1
-    return out
-
 def _mutates(argv):
-    """Best-effort 'does this az command write?' for read-only mode. Catches the
-    verb set AND `rest`/`invoke` with a non-GET --method (the hole a plain verb
-    check misses — `az rest --method POST` is a write that no verb token reveals).
-    Expects a CANONICALIZED argv (see _canon_argv) so a global-flag prefix can't
-    push the real group out of argv[0]. Defense-in-depth only; per-user RBAC is the
-    authoritative boundary."""
+    """Read-only write-detection, WHOLE-argv: a mutating verb anywhere, OR a non-GET
+    --method anywhere (the rest/invoke write signal a plain verb check misses). No
+    global-flag stripping — see the scan-based rationale above. Defense-in-depth
+    only; per-user RBAC is the authoritative boundary."""
     if any(t in _MUTATING for t in argv):
         return True
-    if argv and argv[0] in ("rest", "invoke"):
-        m = "GET"
-        for i, t in enumerate(argv):
-            if t in ("--method", "-m") and i + 1 < len(argv):
-                m = argv[i + 1]
-            elif t.startswith("--method="):
-                m = t.split("=", 1)[1]
-        if m.upper() != "GET":
-            return True
-    return False
+    return _method_nonget(argv)
 
 def _run_capped(argv, env, timeout, cap):
     """Run the wrapper, capturing stdout and stderr on SEPARATE pipes (so the caller
@@ -362,28 +358,31 @@ def az_run(command: str, ctx: Context) -> str:
         argv = shlex.split(command)
     except ValueError as e:
         return json.dumps({"error": f"could not parse command: {e}"})
-    # Gate on the CANONICAL command (global options stripped) so a prefixed/interleaved
-    # global flag can't slip a command past an argv[0]/joined check. We still RUN argv.
-    cargv = _canon_argv(argv)
-    if cargv and cargv[0] in ("interactive", "ssh"):
-        return json.dumps({"error": f"`az {cargv[0]}` is interactive/never-returns and is not supported here. "
-                                    "Use --no-wait + poll, or a bounded query."})
+    # Gates SCAN THE WHOLE argv for danger signals (see the rationale above the scan
+    # helpers): immune to global-flag position, abbreviation (`az --deb rest …`), and
+    # future az globals. Erring toward reject can only refuse a command, never leak.
+    if "interactive" in argv or "ssh" in argv:
+        return json.dumps({"error": "`az interactive` / `az ssh` are interactive/never-return and are not "
+                                    "supported here. Use --no-wait + poll, or a bounded query."})
     if any(t in ("--follow", "--watch") for t in argv):
         return json.dumps({"error": "--follow/--watch never return here. Fetch a bounded snapshot "
                                     "(e.g. --lines N) or use --no-wait + poll."})
-    if READONLY and _mutates(cargv):
+    if READONLY and _mutates(argv):
         return json.dumps({"error": "server is in read-only mode (AZOBO_READONLY): this command appears "
                                     "to mutate (a write verb, or rest/invoke with a non-GET method). "
                                     "Only read operations are permitted."})
-    joined = " ".join(cargv)
-    if any(joined == d or joined.startswith(d + " ") for d in DENY_CMDS):
+    if _deny_hit(argv):
         return json.dumps({"error": "that command is disabled on this server (AZOBO_DENY_COMMANDS)."})
-    if cargv and cargv[0] in ("rest", "invoke"):
-        ok, host = _rest_host_ok(cargv)
-        if not ok:
-            return json.dumps({"error": f"az rest is restricted to Microsoft/Azure endpoints; host {host!r} "
-                "is not allowed. OBO tokens are only valid at Microsoft first-party services — targeting "
-                "anything else is rejected (AZOBO_REST_ALLOWED_DOMAINS)."})
+    # Anti-exfiltration: any --url/--uri (rest/invoke also honors -u) must resolve to
+    # an allow-listed Microsoft/Azure host. An OBO token is only valid at Microsoft
+    # first-party services, so any other host is exfiltration — reject. Fires on the
+    # url flag itself, wherever it sits, so a global prefix/abbreviation can't dodge it.
+    if REST_ALLOWED:
+        host = _url_host(argv)
+        if host is not None and not _host_allowed(host):
+            return json.dumps({"error": f"az rest/invoke is restricted to Microsoft/Azure endpoints; host "
+                f"{host!r} is not allowed. OBO tokens are only valid at Microsoft first-party services — "
+                "targeting anything else is rejected (AZOBO_REST_ALLOWED_DOMAINS)."})
 
     # Register a short-lived broker session for this user, and hand the subprocess
     # only the opaque session id — NOT the assertion and NOT the cert. The wrapper
