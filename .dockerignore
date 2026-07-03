@@ -1,0 +1,13 @@
+venv/
+.venv/
+.git/
+__pycache__/
+*.pyc
+.env
+deploy/
+*.bak.*
+*.premigrate
+output/
+test_*.py
+mint.py
+.pytest_cache/
