@@ -236,8 +236,9 @@ This server runs the full Azure CLI as the signed-in user; treat it accordingly.
   refuses mutating `az` verbs incl. `rest`/`invoke` non-GET) — the dangerous default is the
   safe one. Set it `false` to allow writes (then per-user RBAC is the boundary). Note this is
   **defense-in-depth, not a hard boundary** — a best-effort blocklist, not a command
-  allowlist. For a *real* read-only deployment, assign users only **Reader** RBAC + read-only
-  consent; RBAC is authoritative.
+  allowlist, and the verb list is intentionally **non-exhaustive / fail-open** (see *Deliberate
+  limitations & residual risk* below). For a *real* read-only deployment, assign users only
+  **Reader** RBAC + read-only consent; RBAC is authoritative.
 - **Egress.** The unit blocks IMDS/link-local (`IPAddressDeny=169.254.0.0/16 fe80::/10`) so
   `az rest`/SSRF can't lift the *host's* managed-identity token. ⚠️ `IPAddressDeny` needs
   cgroup/BPF — on some container hosts it silently no-ops; verify with
@@ -292,6 +293,45 @@ closes even that.
 - *Less than fully trusted callers:* apply the lock-it-down recipe above (read-only,
   scope/client allow-lists, the `rest` domain-lock, deny `account get-access-token`) **and** an
   egress proxy allow-list — or don't expose it.
+
+### Deliberate limitations & residual risk
+
+Several controls here are **guardrails, not boundaries** — documented so no operator mistakes
+one for the other. The single boundary this tool relies on is per-user Azure RBAC ∩ the OBO
+consent grant, enforced by Azure itself; everything in `server.py` sits *in front* of that and
+is best-effort by design.
+
+- **The read-only verb list is intentionally non-exhaustive and fail-open.** `az` has no clean
+  read/write taxonomy and gains verbs every release, so no static list of mutating verbs can
+  be complete. This is acceptable because `AZOBO_READONLY` **grants nothing**: a write it fails
+  to catch still executes only under the caller's own RBAC ∩ consent — exactly what that user
+  could already do unaided. It exists to stop *accidental* writes, not a determined one. For a
+  genuinely read-only deployment, assign **Reader** RBAC + read-only consent and let Azure
+  enforce it server-side; that is the boundary, and it does not depend on this list.
+
+- **The `rest` domain allow-list defaults to broad Microsoft service namespaces**
+  (`*.windows.net`, `*.azure.net`, …). Those cover customer-provisionable data-plane hosts
+  (storage, Key Vault, …), so a caller could still direct an OBO token at an Azure resource
+  *they* control. Narrow `AZOBO_REST_ALLOWED_DOMAINS` to the specific first-party hosts you
+  use, and/or front outbound traffic with an egress proxy, if that matters for your exposure.
+
+- **Server-side policy is advisory relative to the credential source.** READONLY, the domain
+  lock and the command denylist are enforced in `server.py`, before `az` runs. The broker — the
+  only holder of the cert — will mint whatever scope a live session requests. So code executing
+  *inside* the `az` process (a malicious extension, a future CLI defect) could mint a token for
+  that user without those gates. It is still only that one user's short-lived, online,
+  revocable, audited authority — never the shared cert (that path is closed; see the threat
+  model above). To tighten it, enforce a per-session scope allow-list at the broker and grant
+  no more consent than users actually need.
+
+- **There is no network-layer egress backstop for public hosts by default.** The app-layer
+  domain lock is the only outbound control out of the box (the unit does block IMDS/link-local).
+  For less-trusted exposure, place the service behind an egress proxy / NSG allow-list to
+  first-party endpoints — the app-layer check should not be the only line.
+
+None of these change the posture the tool is built for — trusted operators, per-user RBAC as
+the boundary. They are the surface to harden (mostly at deploy time) before exposing it to
+anything less trusted.
 
 ## License
 

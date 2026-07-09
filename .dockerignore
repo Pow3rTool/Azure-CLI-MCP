@@ -3,11 +3,23 @@ venv/
 .git/
 __pycache__/
 *.pyc
+.pytest_cache/
+
+# Secrets / local config — at parity with .gitignore so a future `COPY . .` can't
+# bake an OBO key/cert or env into image layers.
+*.env
 .env
+*.key
+*.pem
+*.crt
+*.pfx
+azobo.env
+
+# Local audit / output / build cruft
+audit.log
+output/
 deploy/
 *.bak.*
 *.premigrate
-output/
 test_*.py
 mint.py
-.pytest_cache/

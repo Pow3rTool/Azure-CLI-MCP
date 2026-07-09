@@ -13,6 +13,7 @@ os.environ.setdefault("AZOBO_CERT_THUMBPRINT", "AABB")
 os.environ.setdefault("AZOBO_CERT_KEY", "/dev/null")
 os.environ.setdefault("AZOBO_CERT_PUB", "/dev/null")
 os.environ["AZOBO_VALIDATE_TOKENS"] = "false"  # don't JWKS-validate the dummy assertions here
+os.environ["AZOBO_ALLOW_INSECURE"] = "1"        # ack the dev posture (fail-closed guard)
 
 import obo_broker  # noqa: E402
 

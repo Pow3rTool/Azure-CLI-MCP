@@ -80,22 +80,87 @@ _rest_env = os.environ.get("AZOBO_REST_ALLOWED_DOMAINS", "").strip()
 REST_ALLOWED = ([] if _rest_env == "*" else
                 [d.strip().lower() for d in (_rest_env or _DEFAULT_REST_DOMAINS).split(",") if d.strip()])
 
-# Optional concurrency cap (backstop alongside MemoryMax). 0 = unlimited.
-MAX_CONC = int(os.environ.get("AZOBO_MAX_CONCURRENCY", "0"))
+# Concurrency cap (backstop alongside MemoryMax). Defaults to a small positive value
+# so the SERVER enforces a memory ceiling on its own — worst-case live footprint is
+# MAX_CONC x MAX_CAPTURE (default 8 x 20 MB = 160 MB) — even when the optional systemd
+# MemoryMax isn't set. Set 0 to disable (unbounded).
+MAX_CONC = int(os.environ.get("AZOBO_MAX_CONCURRENCY", "8"))
 import contextlib
 _sem = threading.Semaphore(MAX_CONC) if MAX_CONC > 0 else None
 def _nullctx():
     return contextlib.nullcontext()
 
-# Audit: redact secret-bearing flag VALUES from the logged command. Matches a
-# quoted (possibly multi-word) value OR a bare token, so `--value "a b"` doesn't
-# leak its tail.
+# Audit: redact secret-bearing flag VALUES from the logged command. We scrub
+# STRUCTURALLY (over the tokenized argv), not by matching a literal flag string, so
+# the same parser-desync that the exfil/write gates defend against can't sneak a
+# secret past the log either:
+#   - flags are matched by PREFIX (`--account-k` == `az`'s abbreviation of --account-key);
+#   - ALL value tokens up to the next option are masked (nargs flags like
+#     `--headers K=1 Authorization=<SECRET>` don't leak their tail);
+#   - secret QUERY PARAMS inside any URL token (`?sig=`, `code=`, `AccountKey=`) are
+#     masked even when the flag itself isn't secret (`--url https://…?sig=<SAS>`).
+# Over-redaction is safe here: a false match only costs audit readability, never leaks.
+_SECRET_FLAGS = ("password", "secret", "value", "client-secret", "certificate-password",
+                 "body", "header", "headers", "token", "sas-token", "sas_token",
+                 "account-key", "connection-string", "admin-password", "certificate")
+_SECRET_QS = re.compile(
+    r'((?:sig|code|access[_-]?token|id[_-]?token|refresh[_-]?token|account[_-]?key|'
+    r'accountkey|password|secret|client[_-]?secret)=)[^&\s\'"]+', re.I)
+# Fallback for when the command can't be tokenized (shouldn't happen post-parse).
 _SECRET_FLAG = re.compile(
     r'(--(?:password|secret|value|client-secret|certificate-password|body|headers?|'
     r'token|sas[-_]?token|account-key|connection-string|admin-password)[ =])'
     r'("[^"]*"|\'[^\']*\'|\S+)', re.I)
+
+def _redact_url_secrets(s):
+    return _SECRET_QS.sub(lambda m: m.group(1) + "***", s)
+
+def _is_secret_flag(flag):
+    """A --flag (possibly az-abbreviated) whose value is secret. Prefix-matched: the
+    typed flag must be a >=3-char prefix of a known secret flag name (so `--account-k`
+    and `--pass` are caught the same as the CLI would expand them)."""
+    f = flag.lstrip("-").lower()
+    return len(f) >= 3 and any(name.startswith(f) for name in _SECRET_FLAGS)
+
 def _scrub(cmd):
-    return _SECRET_FLAG.sub(lambda m: m.group(1) + "***", cmd or "")[:500]
+    if not cmd:
+        return ""
+    try:
+        toks = shlex.split(cmd)
+    except ValueError:
+        return _SECRET_FLAG.sub(lambda m: m.group(1) + "***", cmd)[:500]
+    out, i = [], 0
+    while i < len(toks):
+        t = toks[i]
+        flag = t.split("=", 1)[0]
+        if t.startswith("-") and _is_secret_flag(flag):
+            if "=" in t:
+                out.append(flag + "=***"); i += 1
+            else:
+                out.append(t); i += 1
+                masked = False
+                while i < len(toks) and not toks[i].startswith("-"):
+                    i += 1; masked = True
+                if masked:
+                    out.append("***")
+        else:
+            out.append(_redact_url_secrets(t)); i += 1
+    return " ".join(out)[:500]
+
+# Redact secrets that appear in RETURNED/cached output too: bearer/JWT-shaped
+# tokens, `Authorization:` headers, `"accessToken":` bodies, and URL secret params.
+# Applied to what we return to the model AND what we retain for read_output.
+_OUT_SECRET = re.compile(
+    r'(?i)(bearer\s+|authorization["\':=\s]+bearer\s+|"?access[_-]?token"?\s*[:=]\s*"?|'
+    r'"?id[_-]?token"?\s*[:=]\s*"?|"?refresh[_-]?token"?\s*[:=]\s*"?)([A-Za-z0-9._~+/=-]{20,})')
+_JWT = re.compile(r'eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}')
+
+def _scrub_output(s):
+    if not s:
+        return s
+    s = _JWT.sub("***", s)
+    s = _OUT_SECRET.sub(lambda m: m.group(1) + "***", s)
+    return _redact_url_secrets(s)
 
 # ---------------------------------------------------------------------------
 # Command gating by SCANNING THE WHOLE argv for danger signals — never by trying
@@ -117,30 +182,54 @@ def _host_of(url):
 def _host_allowed(host):
     return bool(host) and any(host == d or host.endswith("." + d) for d in REST_ALLOWED)
 
-def _url_host(argv):
-    """Host of the first --url/--uri (any position; `=` or space form) anywhere in
-    argv, or None if no url flag is present ("" if present-but-unparseable). `-u` is
-    honored ONLY for rest/invoke (elsewhere `-u` is commonly --username)."""
-    restish = ("rest" in argv) or ("invoke" in argv)
-    flags = ("--url", "--uri", "-u") if restish else ("--url", "--uri")
-    prefixes = ("--url=", "--uri=", "-u=") if restish else ("--url=", "--uri=")
-    for i, t in enumerate(argv):
-        if t in flags and i + 1 < len(argv):
-            return _host_of(argv[i + 1])
-        if t.startswith(prefixes):
-            return _host_of(t.split("=", 1)[1])
-    return None
+# A token whose ENTIRE value is an http(s) URL: a bare URL, an attached short-opt
+# (`-uhttps://…`, `-u=https://…`), or a `--flag=https://…`. We match the whole token,
+# NOT a substring, so a URL that merely appears INSIDE a larger value — e.g. a webhook
+# endpoint embedded in a `--body {"url":"https://…"}` JSON blob, which is data sent TO
+# an allowed host, not a destination — does not trip the exfil gate.
+_TOKEN_URL = re.compile(r'^(?:--[^=\s]+=|-[A-Za-z]=?)?(https?://[^\s\'"]+)$', re.I)
+
+def _argv_hosts(argv):
+    """Every http(s) host that appears as a flag VALUE anywhere in argv, found by value
+    SHAPE rather than by flag name. This deliberately does NOT reproduce `az`'s option
+    parsing (the leaky path — see the doctrine above); keying on the URL value catches
+    every form the CLI parses identically:
+      - bare value after any flag  `--url … / --blob-url … / --source-uri …`
+      - attached short-opt         `-uhttps://HOST/…`
+      - `=` form                   `--url=…`, `--uri=…`, `-u=…`
+      - DUPLICATE url flags         every value is returned, so `az`'s last-wins is moot
+    Returns the hosts (lower-cased; "" if a value had no parseable host). Finding more
+    URLs only ADDS allow-list constraints, so a false match can only ever REFUSE a
+    command, never leak one — consistent with the scan doctrine."""
+    hosts = []
+    for t in argv:
+        m = _TOKEN_URL.match(t)
+        if m:
+            hosts.append(_host_of(m.group(1)))
+    return hosts
 
 def _method_nonget(argv):
-    """True if a --method/-m (any position; `=` or space form) is present and not
-    GET. Only rest/invoke take --method, so this is the rest/invoke *write* signal —
-    position- and abbreviation-independent."""
+    """rest/invoke *write* signal: a --method/-m that isn't GET, in ANY form `az` accepts
+    — space, `=`, attached short (`-mPOST`), or unambiguous abbreviation (`--meth POST`).
+    We over-match the flag SPELLING (any >=3-char prefix of `--method`, plus attached
+    `-m<val>`); since a false match only tightens READONLY (refuses), never leaks, the
+    superset is safe. Gated on rest/invoke because only they take --method (elsewhere
+    `-m`/`--m…` mean other things, e.g. `--max-items`)."""
+    if not (("rest" in argv) or ("invoke" in argv)):
+        return False
+    def _method_flag(flag):
+        return flag == "-m" or (len(flag) >= 3 and "--method".startswith(flag))
     m = "GET"
     for i, t in enumerate(argv):
-        if t in ("--method", "-m") and i + 1 < len(argv):
-            m = argv[i + 1]
-        elif t.startswith(("--method=", "-m=")):
-            m = t.split("=", 1)[1]
+        if t.startswith("-m") and not t.startswith("--") and len(t) > 2:
+            m = t[3:] if t.startswith("-m=") else t[2:]          # -mPOST / -m=POST
+            continue
+        flag = t.split("=", 1)[0]
+        if _method_flag(flag):
+            if "=" in t:
+                m = t.split("=", 1)[1]
+            elif i + 1 < len(argv):
+                m = argv[i + 1]
     return m.strip().upper() != "GET"
 
 def _deny_hit(argv):
@@ -154,8 +243,12 @@ def _deny_hit(argv):
                 return True
     return False
 
-# Azure CLI verbs that mutate — refused in read-only mode. Best-effort (the CLI
-# has no clean read/write taxonomy); RBAC remains the authoritative boundary.
+# Azure CLI verbs that mutate — refused in read-only mode. INTENTIONALLY NON-EXHAUSTIVE
+# and fail-open BY DESIGN: the CLI has no clean read/write taxonomy and adds verbs
+# constantly, so no static denylist is complete. Safe because READONLY grants nothing —
+# an uncaught verb still runs only under the caller's own RBAC ∩ OBO consent. It's a
+# guardrail against accidental writes, NOT a boundary; RBAC is the boundary. For a real
+# read-only deployment assign Reader RBAC. (See "Deliberate limitations" in the README.)
 _MUTATING = {"create", "delete", "update", "set", "add", "remove", "purge", "regenerate",
              "reset", "restart", "start", "stop", "deallocate", "import", "upload", "attach",
              "detach", "enable", "disable", "assign", "grant", "revoke", "move", "run-command",
@@ -225,7 +318,12 @@ def _identity(bearer):
     for this tenant+app (signature via JWKS, audience, issuer, expiry). Returns None
     when the token fails validation — callers MUST reject. This is the access control
     for read_output (which never does an OBO exchange). When AZOBO_VALIDATE_TOKENS is
-    off, falls back to the unverified payload (lab/trusted only)."""
+    off, falls back to the unverified payload (lab/trusted only).
+
+    NOTE: when AZOBO_VALIDATE_TOKENS is off, `oid` comes from an UNVERIFIED,
+    caller-controllable payload — so read_output's cross-user ownership guard (which
+    keys on this oid) is effectively VOID. Insecure mode is single-user / trusted only;
+    the unguessable 48-bit output_id is then the sole barrier between callers."""
     if not bearer:
         return None
     if not VALIDATE:
@@ -257,8 +355,16 @@ def _audit(who, tool, cmd, rc, dur, n, oid):
     try:
         with _lock, open(AUDIT, "a") as f:
             f.write(rec + "\n")
-    except Exception:
-        pass
+    except Exception as e:
+        # Fail-OPEN would drop the record silently if the FSIZE-limited data path is
+        # full/unwritable. Fall back to stderr so systemd/journald captures a
+        # durable copy on a separate sink, and mark the degraded state — never a
+        # silent accountability gap.
+        try:
+            import sys
+            print(f"AUDIT-FALLBACK ({type(e).__name__}): {rec}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
 
 def _store(who, out):
     """Retain captured output in memory (owner-stamped), evicting expired, then
@@ -275,7 +381,11 @@ def _store(who, out):
     return oid
 
 def _finalize(owner, who, tool, cmd, out, rc, dur):
-    """Retain full output in memory (owner-stamped by oid), audit, return capped view."""
+    """Retain full output in memory (owner-stamped by oid), audit, return capped view.
+    Output is secret-scrubbed FIRST so bearer/JWT tokens and SAS query params —
+    e.g. from `--debug`/`--verbose` HTTP diagnostics or an error body — are redacted in
+    BOTH what we return to the model and what read_output can page back later."""
+    out = _scrub_output(out)
     oid = _store(owner, out)
     _audit(who, tool, cmd, rc, dur, len(out), oid)
     if len(out) <= MAX_OUT:
@@ -373,15 +483,17 @@ def az_run(command: str, ctx: Context) -> str:
                                     "Only read operations are permitted."})
     if _deny_hit(argv):
         return json.dumps({"error": "that command is disabled on this server (AZOBO_DENY_COMMANDS)."})
-    # Anti-exfiltration: any --url/--uri (rest/invoke also honors -u) must resolve to
-    # an allow-listed Microsoft/Azure host. An OBO token is only valid at Microsoft
-    # first-party services, so any other host is exfiltration — reject. Fires on the
-    # url flag itself, wherever it sits, so a global prefix/abbreviation can't dodge it.
+    # Anti-exfiltration: EVERY http(s) URL anywhere in argv must resolve to an
+    # allow-listed Microsoft/Azure host. An OBO token is only valid at Microsoft
+    # first-party services, so any other host is exfiltration — reject. We check the
+    # URL values themselves (not flag names), so attached short-opts (`-uHOST`),
+    # duplicate `--url` (az last-wins), abbreviations, and non-rest url flags
+    # (`--blob-url`, `--source-uri`) are all covered. Erring toward reject can't leak.
     if REST_ALLOWED:
-        host = _url_host(argv)
-        if host is not None and not _host_allowed(host):
-            return json.dumps({"error": f"az rest/invoke is restricted to Microsoft/Azure endpoints; host "
-                f"{host!r} is not allowed. OBO tokens are only valid at Microsoft first-party services — "
+        bad = next((h for h in _argv_hosts(argv) if not _host_allowed(h)), None)
+        if bad is not None:
+            return json.dumps({"error": f"az is restricted to Microsoft/Azure endpoints; host "
+                f"{bad!r} is not allowed. OBO tokens are only valid at Microsoft first-party services — "
                 "targeting anything else is rejected (AZOBO_REST_ALLOWED_DOMAINS)."})
 
     # Register a short-lived broker session for this user, and hand the subprocess
@@ -437,11 +549,15 @@ def read_output(output_id: str, ctx: Context, offset: int = 0, max_chars: int = 
         v = _outputs.get(output_id)
         if v and now - v[2] > OUT_TTL:
             _outputs.pop(output_id, None); v = None
+    # Single indistinguishable error for missing / expired / wrong-owner so a caller
+    # holding someone else's output_id can't tell "live but not yours" from "gone"
+    # (no existence oracle). The 48-bit id remains the capability barrier.
+    _NF = json.dumps({"error": "output_id not found (expired/evicted or wrong id)"})
     if not v:
-        return json.dumps({"error": "output_id not found (expired/evicted or wrong id)"})
+        return _NF
     owner, data, _ts = v
     if owner != caller_owner:
-        return json.dumps({"error": "that output_id belongs to another user"})
+        return _NF
     m = max_chars or MAX_OUT; chunk = data[offset:offset + m]; end = offset + len(chunk)
     more = (f"\n\n[chars {offset}-{end} of {len(data)}; more: read_output('{output_id}', offset={end})]"
             if end < len(data) else "")

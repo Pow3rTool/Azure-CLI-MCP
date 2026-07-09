@@ -3,6 +3,15 @@
 # ONE image, run as TWO containers (broker + server) sharing a /run/azobo socket:
 #   broker:  python obo_broker.py   (holds the OBO cert; mint tokens over the socket)
 #   server:  python server.py       (default CMD; shells out to `az`, no cert access)
+#
+# CERT-ISOLATION IS OPERATOR-ENFORCED HERE, NOT STRUCTURAL. Unlike the systemd
+# deploy (distinct broker/server users + InaccessiblePaths on the key), this image
+# builds ONE uid (10001) for both roles. You MUST therefore, at run time:
+#   - run broker and server as SEPARATE containers, and
+#   - mount the OBO key (AZOBO_CERT_KEY/PUB) ONLY into the broker container.
+# Mounting the key into the server/`az` container, or running both roles in one
+# container, hands the user-driven `az` child the shared confidential-client cert and
+# defeats the broker boundary. No key ships in the image; this is a run-time footgun.
 # NOTE: bundles the full azure-cli (via requirements.txt) — large image, slow build; inherent
 # to how azobo works (it subprocess-runs `az`). In-container the server calls the container's
 # python + wrapper: run it with AZOBO_PYTHON=/usr/local/bin/python AZOBO_WRAPPER=/app/azobo.
