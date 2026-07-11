@@ -511,7 +511,13 @@ def az_run(command: str, ctx: Context) -> str:
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
            "HOME": cfg, "LANG": os.environ.get("LANG", "C.UTF-8"),
            "AZURE_TENANT_ID": TENANT, "AZURE_SUBSCRIPTION_ID": DEFAULT_SUB,
-           "AZURE_CONFIG_DIR": cfg, "AZURE_EXTENSION_DIR": os.path.join(cfg, "ext"),
+           # AZURE_CONFIG_DIR stays per-call ephemeral (profile/token-cache isolation
+           # between calls — the actual security-relevant boundary). Extensions are
+           # static, non-secret, identical across every call, and pre-baked at build
+           # time (never installed at runtime — see AZURE_CORE_DISABLE_DYNAMIC_INSTALL
+           # below), so they live at a fixed path instead of the ephemeral cfg dir.
+           "AZURE_CONFIG_DIR": cfg,
+           "AZURE_EXTENSION_DIR": os.environ.get("AZOBO_EXTENSION_DIR", "/opt/az-extensions"),
            "AZURE_CORE_DISABLE_DYNAMIC_INSTALL": "yes", "AZURE_CORE_COLLECT_TELEMETRY": "no",
            "AZOBO_BROKER_SOCKET": BROKER_SOCKET, "AZOBO_SESSION": sid}
     try:

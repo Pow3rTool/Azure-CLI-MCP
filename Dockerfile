@@ -22,6 +22,15 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Pre-baked az CLI extensions — pinned + reviewed like any other dependency, NEVER
+# installed at runtime (server.py hardcodes AZURE_CORE_DISABLE_DYNAMIC_INSTALL=yes
+# on every az_run subprocess, by design). Fixed path so server.py's AZURE_EXTENSION_DIR
+# (env-overridable via AZOBO_EXTENSION_DIR) can find it regardless of the per-call
+# ephemeral AZURE_CONFIG_DIR.
+ENV AZURE_EXTENSION_DIR=/opt/az-extensions
+RUN az extension add --name resource-graph --version 2.1.1 \
+ && chmod -R a+rX /opt/az-extensions
+
 # server + broker + the `azobo` az-wrapper the server spawns
 COPY server.py obo_broker.py azobo ./
 RUN useradd --system --uid 10001 mcp
