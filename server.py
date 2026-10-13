@@ -1,12 +1,19 @@
-import os, re, shlex, shutil, signal, socket, subprocess, tempfile, json, time, uuid, base64, threading
+import os, re, shlex, shutil, signal, socket, subprocess, tempfile, json, time, uuid, base64, threading, sys
 from collections import OrderedDict
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp import Context
+from mcp_http_auth import AuthenticatedFastMCP as FastMCP, HTTPAuth
 from mcp.server.transport_security import TransportSecuritySettings
 
 # Anything we DO write (only the audit log) is owner-only.
 os.umask(0o077)
 
 PUBLIC_HOST = os.environ.get("AZOBO_PUBLIC_HOST", "localhost")
+TRUSTED_ORIGINS = list(dict.fromkeys([
+    f"https://{PUBLIC_HOST}",
+    "http://127.0.0.1:8782",
+    *[origin.strip() for origin in os.environ.get("AZOBO_ALLOWED_ORIGINS", "").split(",")
+      if origin.strip()],
+]))
 TENANT = os.environ["AZOBO_TENANT_ID"]; CLIENT = os.environ["AZOBO_CLIENT_ID"]
 DEFAULT_SUB = os.environ.get("AZOBO_DEFAULT_SUBSCRIPTION", "")
 VENV_PY = os.environ.get("AZOBO_PYTHON", "/opt/azobo/venv/bin/python")
@@ -56,6 +63,17 @@ if not VALIDATE and os.environ.get("AZOBO_ALLOW_INSECURE", "").lower() not in ("
 # client obtains for THIS resource app would otherwise pass. Set these in prod.
 REQUIRED_SCOPE = os.environ.get("AZOBO_REQUIRED_SCOPE", "").strip()
 ALLOWED_CLIENTS = [x.strip() for x in os.environ.get("AZOBO_ALLOWED_CLIENTS", "").split(",") if x.strip()]
+
+# OAuth diagnostics for implementation/support periods:
+#   off     = no bearer-validation event logs
+#   summary = result/reason plus selected non-secret client/token claims
+#   claims  = bounded full JWT payload claims (can contain PII/groups; use briefly)
+# The bearer itself, JWT signature, and exception text are NEVER logged. Rejected
+# payload claims are attacker-controlled and explicitly marked unverified.
+AUTH_DIAGNOSTICS = os.environ.get("AZOBO_AUTH_DIAGNOSTICS", "off").strip().lower()
+if AUTH_DIAGNOSTICS not in ("off", "summary", "claims"):
+    raise SystemExit("AZOBO_AUTH_DIAGNOSTICS must be one of: off, summary, claims")
+_AUTH_SUMMARY_KEYS = ("azp", "appid", "aud", "tid", "scp", "roles", "iss", "exp", "nbf", "iat")
 
 # Command denylist (egress/exfil control). e.g. "account get-access-token" to remove
 # the raw-token-to-stdout primitive. (`rest` is handled by the domain allow-list below,
@@ -262,6 +280,8 @@ _lock = threading.Lock()
 _outputs = OrderedDict()  # output_id -> (owner_oid, text, ts)
 
 mcp = FastMCP("azure-obo",
+    http_auth=HTTPAuth(resource=f"https://{PUBLIC_HOST}/azcli", tenant=TENANT,
+                       scope=REQUIRED_SCOPE, verify=lambda token: _identity(token)),
     instructions=("Operate Azure and Entra AS THE SIGNED-IN USER (per-user on-behalf-of). "
         "az_run = the full Azure CLI: management plane, the `az ad` directory (Entra apps, "
         "service principals, users, groups), AND any other endpoint via "
@@ -272,7 +292,7 @@ mcp = FastMCP("azure-obo",
     host="127.0.0.1", port=8782, stateless_http=False, json_response=False, streamable_http_path="/",
     transport_security=TransportSecuritySettings(
         allowed_hosts=[PUBLIC_HOST, f"{PUBLIC_HOST}:443", "127.0.0.1:8782", "localhost:8782"],
-        allowed_origins=[f"https://{PUBLIC_HOST}", "http://127.0.0.1:8782"]))
+        allowed_origins=TRUSTED_ORIGINS))
 
 def _bearer(ctx):
     try:
@@ -313,40 +333,101 @@ def _ident(c):
     display = c.get("preferred_username") or c.get("upn") or c.get("oid") or "?"
     return (owner, display)
 
-def _identity(bearer):
-    """Return (owner_oid, display) ONLY after the token is cryptographically verified
-    for this tenant+app (signature via JWKS, audience, issuer, expiry). Returns None
-    when the token fails validation — callers MUST reject. This is the access control
-    for read_output (which never does an OBO exchange). When AZOBO_VALIDATE_TOKENS is
-    off, falls back to the unverified payload (lab/trusted only).
+def _bounded_claim_value(value, depth=0):
+    """Bound untrusted claim data so diagnostics cannot become a log-spam vector."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if depth >= 2:
+        return str(value)[:1024]
+    if isinstance(value, dict):
+        items = list(value.items())[:64]
+        out = {str(k)[:80]: _bounded_claim_value(v, depth + 1) for k, v in items}
+        if len(value) > len(items):
+            out["_truncated"] = f"{len(value) - len(items)} more keys"
+        return out
+    if isinstance(value, (list, tuple)):
+        items = list(value)[:64]
+        out = [_bounded_claim_value(v, depth + 1) for v in items]
+        if len(value) > len(items):
+            out.append(f"... {len(value) - len(items)} more values")
+        return out
+    return str(value)[:1024]
 
-    NOTE: when AZOBO_VALIDATE_TOKENS is off, `oid` comes from an UNVERIFIED,
-    caller-controllable payload — so read_output's cross-user ownership guard (which
-    keys on this oid) is effectively VOID. Insecure mode is single-user / trusted only;
-    the unguessable 48-bit output_id is then the sole barrier between callers."""
-    if not bearer:
-        return None
-    if not VALIDATE:
-        try:
-            p = bearer.split('.')[1]; p += '=' * (-len(p) % 4)
-            return _ident(json.loads(base64.urlsafe_b64decode(p)))
-        except Exception:
-            return ("?", "?")
+def _unverified_claims(bearer):
+    """Decode a JWT payload for diagnostics only; never use this for authorization."""
     try:
-        import jwt
-        signing = _jwks_client().get_signing_key_from_jwt(bearer).key
-        claims = jwt.decode(bearer, signing, algorithms=["RS256"], audience=AUDIENCE,
-                            options={"require": ["exp"], "verify_aud": True})
-        if claims.get("iss", "") not in (f"https://login.microsoftonline.com/{TENANT}/v2.0",
-                                          f"https://sts.windows.net/{TENANT}/"):
+        parts = bearer.split(".")
+        if len(parts) != 3:
             return None
-        if REQUIRED_SCOPE and REQUIRED_SCOPE not in str(claims.get("scp", "")).split():
-            return None
-        if ALLOWED_CLIENTS and (claims.get("azp") or claims.get("appid")) not in ALLOWED_CLIENTS:
-            return None
-        return _ident(claims)
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        return claims if isinstance(claims, dict) else None
     except Exception:
         return None
+
+def _auth_event(outcome, reason, claims=None, claims_verified=False):
+    """Write one structured auth event and return its short support reference."""
+    if AUTH_DIAGNOSTICS == "off":
+        return ""
+    ref = uuid.uuid4().hex[:12]
+    rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+           "event": f"auth_{outcome}", "auth_ref": ref, "reason": str(reason)[:120],
+           "claims_verified": bool(claims_verified)}
+    if isinstance(claims, dict):
+        if AUTH_DIAGNOSTICS == "claims":
+            rec["claims"] = _bounded_claim_value(claims)
+        else:
+            rec["claims"] = {k: _bounded_claim_value(claims[k])
+                             for k in _AUTH_SUMMARY_KEYS if k in claims}
+    else:
+        rec["token_shape"] = "unparseable_or_missing"
+    line = json.dumps(rec, separators=(",", ":"), sort_keys=True)
+    if len(line) > 16384:
+        rec["claims"] = {k: _bounded_claim_value(claims[k])
+                         for k in _AUTH_SUMMARY_KEYS if k in (claims or {})}
+        rec["claims_truncated"] = True
+        line = json.dumps(rec, separators=(",", ":"), sort_keys=True)
+    try:
+        print("AUTH-" + outcome.upper() + " " + line, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+    return ref
+
+def _identity_result(bearer):
+    """Return ((owner, display) or None, auth_ref), with diagnostic logging."""
+    if not bearer:
+        return None, _auth_event("reject", "missing_bearer")
+    unverified = _unverified_claims(bearer)
+    if not VALIDATE:
+        claims = unverified or {}
+        ref = _auth_event("accept", "validation_disabled", claims, claims_verified=False)
+        return _ident(claims), ref
+    try:
+        signing = _jwks_client().get_signing_key_from_jwt(bearer).key
+    except Exception as e:
+        return None, _auth_event("reject", f"jwks:{type(e).__name__}", unverified)
+    try:
+        import jwt
+        claims = jwt.decode(bearer, signing, algorithms=["RS256"], audience=AUDIENCE,
+                            options={"require": ["exp"], "verify_aud": True})
+    except Exception as e:
+        return None, _auth_event("reject", f"jwt:{type(e).__name__}", unverified)
+    if claims.get("iss", "") not in (f"https://login.microsoftonline.com/{TENANT}/v2.0",
+                                      f"https://sts.windows.net/{TENANT}/"):
+        return None, _auth_event("reject", "issuer_not_allowed", claims,
+                                 claims_verified=True)
+    if REQUIRED_SCOPE and REQUIRED_SCOPE not in str(claims.get("scp", "")).split():
+        return None, _auth_event("reject", "required_scope_missing", claims,
+                                 claims_verified=True)
+    if ALLOWED_CLIENTS and (claims.get("azp") or claims.get("appid")) not in ALLOWED_CLIENTS:
+        return None, _auth_event("reject", "client_not_allowed", claims,
+                                 claims_verified=True)
+    ref = _auth_event("accept", "validated", claims, claims_verified=True)
+    return _ident(claims), ref
+
+def _identity(bearer):
+    """Compatibility helper returning only the validated identity."""
+    return _identity_result(bearer)[0]
 
 def _audit(who, tool, cmd, rc, dur, n, oid):
     rec = json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "who": who,
@@ -458,11 +539,14 @@ def az_run(command: str, ctx: Context) -> str:
     read_output(output_id). A 403/AuthorizationFailed/empty result outside your scope is your permission
     boundary, not an error to route around. Writes (create/delete, role/app changes) are real."""
     a = _bearer(ctx)
-    if not a:
-        return json.dumps({"error": "no bearer token on request"})
-    ident = _identity(a)
+    ident, auth_ref = _identity_result(a)
     if ident is None:
-        return json.dumps({"error": "unauthenticated: bearer failed validation (signature/audience/issuer/expiry)"})
+        message = ("no bearer token on request" if not a else
+                   "unauthenticated: bearer failed validation (see server auth diagnostics)")
+        err = {"error": message}
+        if auth_ref:
+            err["auth_ref"] = auth_ref
+        return json.dumps(err)
     owner, who = ident
     try:
         argv = shlex.split(command)
@@ -544,9 +628,12 @@ def read_output(output_id: str, ctx: Context, offset: int = 0, max_chars: int = 
     Pass the output_id from the truncation note. offset = start char; max_chars = how many (default = cap).
     Only the user who produced the output can read it; output is held in memory and expires."""
     a = _bearer(ctx)
-    ident = _identity(a)
+    ident, auth_ref = _identity_result(a)
     if ident is None:
-        return json.dumps({"error": "unauthenticated: bearer failed validation"})
+        err = {"error": "unauthenticated: bearer failed validation (see server auth diagnostics)"}
+        if auth_ref:
+            err["auth_ref"] = auth_ref
+        return json.dumps(err)
     caller_owner, _who = ident
     if not re.fullmatch(r"[0-9a-f]{1,32}", output_id or ""):
         return json.dumps({"error": "bad output_id"})

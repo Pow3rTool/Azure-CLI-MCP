@@ -32,7 +32,7 @@ RUN az extension add --name resource-graph --version 2.1.1 \
  && chmod -R a+rX /opt/az-extensions
 
 # server + broker + the `azobo` az-wrapper the server spawns
-COPY server.py obo_broker.py azobo ./
+COPY server.py obo_broker.py azobo mcp_http_auth.py ./
 RUN useradd --system --uid 10001 mcp
 USER mcp
 
